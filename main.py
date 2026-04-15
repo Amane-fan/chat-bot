@@ -3,6 +3,8 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.tools import tool
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.prompts import MessagesPlaceholder
 
 @tool
 def get_weather(location: str) -> str:
@@ -15,20 +17,21 @@ os.environ["OPENAI_API_KEY"] = os.getenv("DASHSCOPE_API_KEY")
 os.environ["OPENAI_BASE_URL"] = os.getenv("DASHSCOPE_BASE_URL")
 
 model = ChatOpenAI(
-    model="qwen-plus"
+    model="qwen-plus",
+    temperature=1
 )
 model = model.bind_tools([get_weather])
 
 prompt_template = ChatPromptTemplate.from_messages(
     [
-        ("system", "你是一个天气查询助手"),
-        ("human", "请告诉我{province}的天气")
+        ("system", "你是只能助手"),
+        MessagesPlaceholder("history", optional=True),
+        ("human", "{question}")
     ]
 )
 
 chain = prompt_template | model
 
-response = chain.invoke({"province": "广东"})
+response = chain.invoke({"question": "我是Amane,你好"})
 
-print(response)
 print(response.content)
