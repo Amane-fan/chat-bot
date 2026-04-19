@@ -43,7 +43,7 @@ class ChatService:
 
         prompt = ChatPromptTemplate.from_messages(
             [
-                ("system", "你是一个智能助手，冷静客观地回答用户的问题。"),
+                ("system", "你是一个智能助手，热情耐心地回答用户的问题。"),
                 MessagesPlaceholder("history", optional=True),
                 ("human", "{question}"),
             ]
