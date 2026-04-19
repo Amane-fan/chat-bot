@@ -1,6 +1,6 @@
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class MessageRecord(BaseModel):
@@ -45,3 +45,45 @@ class ChatExchangeResponse(BaseModel):
     session: SessionSummary
     user_message: MessageRecord
     assistant_message: MessageRecord
+
+
+class KnowledgeBaseConfig(BaseModel):
+    """知识库的可扩展配置，允许透传额外字段。"""
+
+    # 先固定一组常用字段，同时允许后续实验性配置直接透传进来。
+    model_config = ConfigDict(extra="allow")
+
+    embedding_model: str | None = Field(default=None, max_length=120)
+    chunk_size: int | None = Field(default=None, ge=1, le=10000)
+    chunk_overlap: int | None = Field(default=None, ge=0, le=5000)
+    separator: str | None = Field(default=None, max_length=200)
+
+
+class KnowledgeBaseCreateRequest(BaseModel):
+    """创建知识库时提交的基本信息。"""
+
+    name: str
+    description: str | None = None
+    config: KnowledgeBaseConfig
+
+
+class KnowledgeBaseSummary(BaseModel):
+    """知识库摘要信息。"""
+
+    id: str
+    name: str
+    description: str | None
+    # 返回原始配置对象，前端可以直接展示或回填表单。
+    config: dict[str, Any]
+    document_count: int
+    created_at: str
+    updated_at: str
+
+
+class KnowledgeBaseListResponse(BaseModel):
+    """知识库分页结果。"""
+
+    items: list[KnowledgeBaseSummary]
+    page: int
+    page_size: int
+    total: int

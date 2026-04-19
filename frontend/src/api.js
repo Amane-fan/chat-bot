@@ -54,3 +54,14 @@ export function sendMessage(sessionId, content) {
     body: JSON.stringify({ content }),
   });
 }
+
+export function getKnowledgeBases(page = 1, pageSize = 10) {
+  return request(`/knowledge-bases?page=${page}&page_size=${pageSize}`);
+}
+
+export function createKnowledgeBase(payload) {
+  return request("/knowledge-bases", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}

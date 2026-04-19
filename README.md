@@ -1,22 +1,21 @@
-# LangChain Learning
+# LangChain Chatbot
 
-一个基于 LangChain、FastAPI、Vue 和 Redis 的多会话聊天机器人示例项目。
+一个基于 FastAPI、Vue、Redis 和 MySQL 的聊天机器人示例项目。
 
-项目采用前后端分离架构：
+当前项目包含两条独立的数据链路：
 
-- 后端使用 FastAPI 提供会话管理和聊天接口
-- 前端使用 Vue + Vite 提供单页聊天界面
-- Redis 用于保存会话元数据和消息历史
+- 聊天会话和消息历史继续使用 Redis
+- 知识库元数据使用 MySQL
 - LLM 通过 `langchain_openai.ChatOpenAI` 接入阿里百炼兼容接口
 
-## 功能特性
+## 功能概览
 
-- 多会话管理
+- 多会话聊天
 - 会话创建、重命名、删除
-- 会话消息历史读取
 - Redis 持久化聊天记录
-- 新会话首条消息自动生成标题
-- 前后端分离，便于后续扩展鉴权、流式输出、RAG 等能力
+- 知识库创建
+- 知识库分页列表
+- 前端统一管理会话与知识库
 
 ## 目录结构
 
@@ -24,48 +23,36 @@
 .
 ├── backend/
 │   ├── config.py
+│   ├── db.py
 │   ├── main.py
+│   ├── models.py
 │   ├── schemas.py
+│   ├── sql/
+│   │   └── mysql_schema.sql
 │   └── services/
-│       └── chat_service.py
+│       ├── chat_service.py
+│       └── knowledge_base_service.py
 ├── frontend/
-│   ├── index.html
 │   ├── package.json
-│   ├── vite.config.js
 │   └── src/
 │       ├── App.vue
 │       ├── api.js
-│       ├── main.js
 │       └── style.css
 ├── .env.example
 ├── requirements.txt
 └── README.md
 ```
 
-## 技术栈
-
-### 后端
-
-- Python
-- FastAPI
-- LangChain
-- Redis
-- Uvicorn
-
-### 前端
-
-- Vue 3
-- Vite
-
 ## 环境要求
 
 - Python 3.10+
 - Node.js 18+
 - Redis 6+
+- MySQL 8.0+
 
 ## 环境变量
 
-后端环境变量示例见 [`.env.example`](/home/amane/project/langchain-learning/.env.example:1)。
+参考 [`.env.example`](./.env.example)：
 
 ```env
 DASHSCOPE_API_KEY=your_dashscope_api_key
@@ -76,12 +63,18 @@ REDIS_URL=redis://:your_redis_password@localhost:6379/0
 REDIS_CHAT_HISTORY_PREFIX=chat
 REDIS_CHAT_HISTORY_LIMIT=40
 
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=your_mysql_password
+MYSQL_DATABASE=langchain_chatbot
+
 API_HOST=0.0.0.0
 API_PORT=8000
 BACKEND_CORS_ORIGINS=http://localhost:5173
 ```
 
-前端环境变量示例见 [`frontend/.env.example`](/home/amane/project/langchain-learning/frontend/.env.example:1)。
+前端环境变量参考 [`frontend/.env.example`](./frontend/.env.example)：
 
 ```env
 VITE_API_BASE_URL=http://localhost:8000/api
@@ -89,9 +82,7 @@ VITE_API_BASE_URL=http://localhost:8000/api
 
 ## 安装依赖
 
-### 1. 后端依赖
-
-建议使用虚拟环境。
+后端：
 
 ```bash
 python -m venv .venv
@@ -99,52 +90,44 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. 前端依赖
+前端：
 
 ```bash
 cd frontend
 npm install
 ```
 
-## 启动方式
+## MySQL 建表
 
-### 1. 启动 Redis
+先创建数据库：
 
-确保本地 Redis 已启动，并且 `REDIS_URL` 配置正确。
+```sql
+CREATE DATABASE IF NOT EXISTS langchain_chatbot
+  DEFAULT CHARACTER SET utf8mb4
+  DEFAULT COLLATE utf8mb4_unicode_ci;
+```
 
-例如本地默认端口：
+然后执行 [backend/sql/mysql_schema.sql](./backend/sql/mysql_schema.sql)：
+
+```bash
+mysql -u root -p langchain_chatbot < backend/sql/mysql_schema.sql
+```
+
+## 启动项目
+
+启动 Redis。
 
 ```bash
 redis-server
 ```
 
-如果 Redis 需要密码，请在 `.env` 中配置：
-
-```env
-REDIS_URL=redis://:your_password@localhost:6379/0
-```
-
-### 2. 启动后端
-
-在项目根目录执行：
+启动后端。
 
 ```bash
 uvicorn backend.main:app --reload
 ```
 
-默认地址：
-
-```text
-http://localhost:8000
-```
-
-健康检查接口：
-
-```text
-GET /api/health
-```
-
-### 3. 启动前端
+启动前端。
 
 ```bash
 cd frontend
@@ -153,9 +136,8 @@ npm run dev
 
 默认地址：
 
-```text
-http://localhost:5173
-```
+- 后端：`http://localhost:8000`
+- 前端：`http://localhost:5173`
 
 ## 后端接口
 
@@ -163,67 +145,71 @@ http://localhost:5173
 
 - `GET /api/health`
 
-### 会话管理
+### 会话接口
 
 - `GET /api/sessions`
 - `POST /api/sessions`
 - `PATCH /api/sessions/{session_id}`
 - `DELETE /api/sessions/{session_id}`
-
-### 消息管理
-
 - `GET /api/sessions/{session_id}/messages`
 - `POST /api/sessions/{session_id}/messages`
 
-## Redis 存储设计
+### 知识库接口
 
-当前实现使用了 3 类 key：
+- `POST /api/knowledge-bases`
+- `GET /api/knowledge-bases?page=1&page_size=10`
 
-- `chat:sessions`
-  保存会话 id 的有序集合，按最近更新时间排序
-- `chat:session:{session_id}:meta`
-  保存单个会话的标题、创建时间、更新时间
-- `chat:session:{session_id}:messages`
-  保存该会话的消息列表
+创建知识库请求示例：
 
-其中 `chat` 是默认前缀，可通过 `REDIS_CHAT_HISTORY_PREFIX` 修改。
+```json
+{
+  "name": "产品文档库",
+  "description": "用于存放产品手册和 FAQ",
+  "config": {
+    "embedding_model": "text-embedding-v1",
+    "chunk_size": 500,
+    "chunk_overlap": 50,
+    "separator": "\\n\\n"
+  }
+}
+```
 
-## 核心代码说明
+列表响应示例：
 
-- [backend/main.py](/home/amane/project/langchain-learning/backend/main.py:1)
-  FastAPI 应用入口，定义路由和启动逻辑
-- [backend/services/chat_service.py](/home/amane/project/langchain-learning/backend/services/chat_service.py:27)
-  封装 Redis 和模型调用，是主要业务逻辑所在
-- [backend/schemas.py](/home/amane/project/langchain-learning/backend/schemas.py:1)
-  定义请求和响应的数据结构
-- [backend/config.py](/home/amane/project/langchain-learning/backend/config.py:1)
-  读取环境变量和服务配置
+```json
+{
+  "items": [
+    {
+      "id": "8f2b2f5c8c0a4f0b8f9c1c4f7c2d9a1e",
+      "name": "产品文档库",
+      "description": "用于存放产品手册和 FAQ",
+      "config": {
+        "embedding_model": "text-embedding-v1",
+        "chunk_size": 500,
+        "chunk_overlap": 50,
+        "separator": "\\n\\n"
+      },
+      "document_count": 0,
+      "created_at": "2026-04-19T12:00:00+00:00",
+      "updated_at": "2026-04-19T12:00:00+00:00"
+    }
+  ],
+  "page": 1,
+  "page_size": 10,
+  "total": 1
+}
+```
 
-## 开发建议
+## 存储说明
 
-- 如果你要接入用户体系，建议为会话增加 `user_id`
-- 如果你要支持长对话，建议增加摘要记忆，而不是只保留最近消息
-- 如果你要优化体验，建议把回复改成流式输出
-- 如果你要上线部署，建议把前端 API 地址和后端 CORS 做环境区分
+- Redis 继续保存聊天会话元数据和消息历史
+- MySQL 目前只保存知识库元数据
+- 文档上传、切分、向量化和检索尚未接入，先通过 `config` 和 `document_count` 预留结构
 
-## 常见问题
+## 后续扩展方向
 
-### `.env` 不在 `backend/` 目录下也能加载吗
-
-可以。当前配置文件使用 `python-dotenv` 加载环境变量，只要启动时能按查找规则找到项目根目录的 `.env`，通常就可以生效。
-
-不过更稳的做法是显式指定 `.env` 路径，避免换启动目录后找不到配置文件。
-
-### 为什么聊天记录会保存在 Redis
-
-因为 Redis 适合保存会话列表和按顺序追加的消息记录，读写简单，开发成本低，适合作为当前这个项目的会话存储层。
-
-## 后续可扩展方向
-
-- 流式输出
-- 用户登录与鉴权
-- 长期记忆和摘要
-- 接入工具调用
-- RAG 知识库问答
+- 知识库文档上传
+- 文本切分与向量化
+- 检索增强问答
+- 用户体系与权限隔离
 - Docker 部署
-
