@@ -22,6 +22,7 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+# Local Codex metadata
 .codex
 node_modules/
 frontend/dist/
