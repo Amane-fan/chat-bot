@@ -50,12 +50,14 @@ button {
 .shell {
   display: grid;
   grid-template-columns: 420px minmax(0, 1fr);
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .sidebar {
   display: flex;
   flex-direction: column;
+  min-height: 0;
   gap: 24px;
   padding: 28px;
   color: #f8efe2;
@@ -69,6 +71,7 @@ button {
 .sidebar-sections {
   display: flex;
   flex-direction: column;
+  flex: 1;
   gap: 18px;
   min-height: 0;
   overflow: auto;
@@ -320,7 +323,9 @@ button {
   display: grid;
   grid-template-rows: auto 1fr auto;
   gap: 18px;
+  min-height: 0;
   padding: 28px;
+  overflow: hidden;
 }
 
 .chat-header {
@@ -335,6 +340,7 @@ button {
 }
 
 .message-wall {
+  min-height: 0;
   padding: 20px;
   border-radius: 30px;
   background: var(--surface);
@@ -342,6 +348,7 @@ button {
   box-shadow: var(--shadow);
   backdrop-filter: blur(18px);
   overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .message-card {
@@ -387,11 +394,13 @@ button {
 }
 
 .composer-input {
-  resize: vertical;
+  resize: none;
   min-height: 110px;
+  max-height: 180px;
   padding: 16px;
   border-radius: 18px;
   background: #fffdf9;
+  overflow: auto;
 }
 
 .composer-button {
@@ -426,6 +435,8 @@ button {
 @media (max-width: 960px) {
   .shell {
     grid-template-columns: 1fr;
+    height: auto;
+    overflow: visible;
   }
 
   .sidebar {
@@ -434,11 +445,16 @@ button {
 
   .chat-stage {
     padding-top: 18px;
+    overflow: visible;
   }
 
   .chat-header {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .message-wall {
+    min-height: 420px;
   }
 }
 

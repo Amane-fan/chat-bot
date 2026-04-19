@@ -470,7 +470,6 @@ onMounted(async () => {
           :class="message.role"
         >
           <div class="message-meta">
-            <span>{{ message.role === "user" ? "你" : "助手" }}</span>
             <time>{{ formatTime(message.created_at) }}</time>
           </div>
           <p>{{ message.content }}</p>
