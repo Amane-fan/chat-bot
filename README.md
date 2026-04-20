@@ -1,10 +1,10 @@
 # LangChain Chatbot
 
-一个基于 FastAPI、Vue、Redis 和 MySQL 的聊天机器人示例项目。
+一个基于 FastAPI、Vue、MySQL 和 LangChain 的聊天机器人示例项目。
 
-当前项目包含两条独立的数据链路：
+当前项目包含两类核心数据：
 
-- 聊天会话和消息历史继续使用 Redis
+- 聊天会话和消息历史使用 MySQL
 - 知识库元数据使用 MySQL
 - LLM 通过 `langchain_openai.ChatOpenAI` 接入阿里百炼兼容接口
 
@@ -12,7 +12,7 @@
 
 - 多会话聊天
 - 会话创建、重命名、删除
-- Redis 持久化聊天记录
+- MySQL 持久化聊天记录
 - 知识库创建
 - 知识库分页列表
 - 前端统一管理会话与知识库
@@ -49,7 +49,6 @@
 
 - Python 3.10+
 - Node.js 18+
-- Redis 6+
 - MySQL 8.0+
 
 ## 环境变量
@@ -60,10 +59,6 @@
 DASHSCOPE_API_KEY=your_dashscope_api_key
 DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 DASHSCOPE_DEFAULT_MODEL=qwen-plus
-
-REDIS_URL=redis://:your_redis_password@localhost:6379/0
-REDIS_CHAT_HISTORY_PREFIX=chat
-REDIS_CHAT_HISTORY_LIMIT=40
 
 MYSQL_HOST=127.0.0.1
 MYSQL_PORT=3306
@@ -120,12 +115,6 @@ mysql -u root -p langchain_chatbot < backend/sql/mysql_schema.sql
 ```
 
 ## 启动项目
-
-启动 Redis。
-
-```bash
-redis-server
-```
 
 启动后端。
 
@@ -208,8 +197,8 @@ npm run dev
 
 ## 存储说明
 
-- Redis 继续保存聊天会话元数据和消息历史
-- MySQL 目前只保存知识库元数据
+- MySQL 保存聊天会话元数据和消息历史
+- MySQL 同时保存知识库元数据
 - 文档上传、切分、向量化和检索尚未接入，先通过 `config` 和 `document_count` 预留结构
 
 ## 后续扩展方向

@@ -9,12 +9,7 @@ DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
 DASHSCOPE_BASE_URL = os.getenv("DASHSCOPE_BASE_URL")
 DASHSCOPE_DEFAULT_MODEL = os.getenv("DASHSCOPE_DEFAULT_MODEL", "qwen-plus")
 
-# Redis 用于持久化会话元数据和消息历史。
-REDIS_URL = os.getenv("REDIS_URL")
-REDIS_CHAT_HISTORY_PREFIX = os.getenv("REDIS_CHAT_HISTORY_PREFIX", "chat")
-REDIS_CHAT_HISTORY_LIMIT = int(os.getenv("REDIS_CHAT_HISTORY_LIMIT", "40"))
-
-# MySQL 用于知识库元数据管理。
+# MySQL 用于持久化聊天会话、消息历史和知识库元数据。
 MYSQL_HOST = os.getenv("MYSQL_HOST")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_USER = os.getenv("MYSQL_USER")

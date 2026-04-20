@@ -1,45 +1,61 @@
-import json
 import uuid
 from datetime import datetime, timezone
 
-import redis
 from fastapi import HTTPException
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI
+from sqlalchemy import func, inspect, select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from backend import config
+from backend.db import get_engine, get_session_factory, init_mysql
+from backend.models import ChatMessage, ChatSession
 from backend.schemas import ChatExchangeResponse, MessageRecord, SessionSummary
 
 
-def utc_now() -> str:
-    """返回统一的 UTC 时间字符串，方便前后端展示和排序。"""
+def utc_now() -> datetime:
+    """MySQL DATETIME 不带时区，这里统一存 UTC naive datetime。"""
 
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def epoch_now() -> float:
-    """Redis 的 sorted set 使用时间戳作为排序分值。"""
+def to_iso_string(value: datetime) -> str:
+    """对外响应统一补回 UTC 时区，方便前后端按 ISO 处理。"""
 
-    return datetime.now(timezone.utc).timestamp()
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat()
 
 
 class ChatService:
-    """封装 Redis 和模型链，供路由层直接调用。"""
+    """封装 MySQL 会话存储和模型链，供路由层直接调用。"""
 
     def __init__(self) -> None:
-        self.redis_client: redis.Redis | None = None
         self.chain = None
 
     def startup(self) -> None:
         """应用启动时初始化依赖，避免在模块导入阶段直接失败。"""
 
         self._validate_settings()
-        self.redis_client = redis.Redis.from_url(config.REDIS_URL, decode_responses=True)
+        init_mysql()
         try:
-            self.redis_client.ping()
-        except redis.RedisError as exc:
-            raise RuntimeError("无法连接 Redis，请检查 REDIS_URL 配置") from exc
+            engine = get_engine()
+            with engine.connect():
+                pass
+            inspector = inspect(engine)
+            missing_tables = [
+                table_name
+                for table_name in ("chat_sessions", "chat_messages")
+                if not inspector.has_table(table_name)
+            ]
+            if missing_tables:
+                raise RuntimeError(
+                    "MySQL 中缺少聊天相关表，请先执行 backend/sql/mysql_schema.sql"
+                )
+        except SQLAlchemyError as exc:
+            raise RuntimeError("无法连接 MySQL，请检查 MYSQL_* 配置") from exc
 
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -58,85 +74,90 @@ class ChatService:
     def list_sessions(self) -> list[SessionSummary]:
         """按最近活跃时间返回会话列表。"""
 
-        client = self._get_redis()
-        session_ids = client.zrevrange(self._sessions_index_key(), 0, -1)
-        if not session_ids:
-            return []
+        session_factory = get_session_factory()
+        message_counts = (
+            select(
+                ChatMessage.session_id.label("session_id"),
+                func.count(ChatMessage.id).label("message_count"),
+            )
+            .group_by(ChatMessage.session_id)
+            .subquery()
+        )
 
-        pipeline = client.pipeline()
-        for session_id in session_ids:
-            pipeline.hgetall(self._session_meta_key(session_id))
-            pipeline.llen(self._session_messages_key(session_id))
-        results = pipeline.execute()
+        with session_factory() as session:
+            rows = session.execute(
+                select(
+                    ChatSession,
+                    func.coalesce(message_counts.c.message_count, 0).label("message_count"),
+                )
+                .outerjoin(message_counts, ChatSession.id == message_counts.c.session_id)
+                .order_by(ChatSession.updated_at.desc())
+            ).all()
 
-        summaries: list[SessionSummary] = []
-        for index in range(0, len(results), 2):
-            meta = results[index]
-            message_count = results[index + 1]
-            if not meta:
-                continue
-            summaries.append(self._session_summary_from_meta(meta, message_count))
-        return summaries
+        return [
+            self._session_summary_from_model(chat_session, int(message_count))
+            for chat_session, message_count in rows
+        ]
 
     def create_session(self, title: str | None = None) -> SessionSummary:
         """创建新会话，并写入初始元数据。"""
 
-        client = self._get_redis()
-        session_id = uuid.uuid4().hex
         now = utc_now()
-        meta = {
-            "id": session_id,
-            "title": title or "新对话",
-            "created_at": now,
-            "updated_at": now,
-        }
-        pipeline = client.pipeline()
-        pipeline.hset(self._session_meta_key(session_id), mapping=meta)
-        pipeline.zadd(self._sessions_index_key(), {session_id: epoch_now()})
-        pipeline.execute()
-        return self._session_summary_from_meta(meta, 0)
+        chat_session = ChatSession(
+            id=uuid.uuid4().hex,
+            title=self._normalize_optional_title(title) or "新对话",
+            created_at=now,
+            updated_at=now,
+        )
+
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            session.add(chat_session)
+            session.commit()
+
+        return self._session_summary_from_model(chat_session, 0)
 
     def rename_session(self, session_id: str, title: str) -> SessionSummary:
         """修改会话标题，并刷新会话排序时间。"""
 
-        client = self._get_redis()
-        meta = self.get_session_meta(session_id)
-        meta["title"] = title
-        meta["updated_at"] = utc_now()
-        pipeline = client.pipeline()
-        pipeline.hset(self._session_meta_key(session_id), mapping=meta)
-        pipeline.zadd(self._sessions_index_key(), {session_id: epoch_now()})
-        pipeline.execute()
-        message_count = client.llen(self._session_messages_key(session_id))
-        return self._session_summary_from_meta(meta, message_count)
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            chat_session = self._get_session_or_404(session, session_id)
+            chat_session.title = title
+            chat_session.updated_at = utc_now()
+            message_count = self._count_messages(session, session_id)
+            session.commit()
+            return self._session_summary_from_model(chat_session, message_count)
 
     def delete_session(self, session_id: str) -> None:
-        """删除会话元数据、消息记录和索引。"""
+        """删除会话元数据和关联消息。"""
 
-        client = self._get_redis()
-        self.get_session_meta(session_id)
-        pipeline = client.pipeline()
-        pipeline.delete(self._session_meta_key(session_id))
-        pipeline.delete(self._session_messages_key(session_id))
-        pipeline.zrem(self._sessions_index_key(), session_id)
-        pipeline.execute()
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            chat_session = self._get_session_or_404(session, session_id)
+            session.delete(chat_session)
+            session.commit()
 
     def get_session_messages(self, session_id: str) -> list[MessageRecord]:
         """返回指定会话的完整消息历史。"""
 
-        self.get_session_meta(session_id)
-        return self._load_messages(session_id)
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            self._get_session_or_404(session, session_id)
+            return self._load_messages(session, session_id)
 
     def send_message(self, session_id: str, content: str) -> ChatExchangeResponse:
-        """执行一次问答，并把用户消息和模型回复写入 Redis。"""
+        """执行一次问答，并把用户消息和模型回复写入 MySQL。"""
 
-        client = self._get_redis()
-        meta = self.get_session_meta(session_id)
         normalized_content = content.strip()
         if not normalized_content:
             raise HTTPException(status_code=400, detail="消息内容不能为空")
 
-        history = self._load_history(session_id)
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            self._get_session_or_404(session, session_id)
+            history = self._load_history(session, session_id)
+
         try:
             answer = self._get_chain().invoke(
                 {"question": normalized_content, "history": history}
@@ -144,34 +165,40 @@ class ChatService:
         except Exception as exc:
             raise HTTPException(status_code=502, detail="模型调用失败") from exc
 
-        # 首次发消息时，自动把标题替换成首句摘要，方便前端列表识别会话内容。
-        if meta["title"] == "新对话" and client.llen(self._session_messages_key(session_id)) == 0:
-            meta["title"] = self._build_session_title(normalized_content)
-            meta["updated_at"] = utc_now()
-            pipeline = client.pipeline()
-            pipeline.hset(self._session_meta_key(session_id), mapping=meta)
-            pipeline.zadd(self._sessions_index_key(), {session_id: epoch_now()})
-            pipeline.execute()
+        user_message_created_at = utc_now()
+        assistant_message_created_at = utc_now()
 
-        user_message = self._append_message(session_id, "user", normalized_content)
-        assistant_message = self._append_message(session_id, "assistant", answer)
-        summary = self._session_summary_from_meta(
-            self.get_session_meta(session_id),
-            client.llen(self._session_messages_key(session_id)),
-        )
+        with session_factory() as session:
+            chat_session = self._get_session_or_404(session, session_id)
+            if chat_session.title == "新对话" and self._count_messages(session, session_id) == 0:
+                chat_session.title = self._build_session_title(normalized_content)
+            chat_session.updated_at = assistant_message_created_at
+
+            user_message_model = ChatMessage(
+                session_id=session_id,
+                role="user",
+                content=normalized_content,
+                created_at=user_message_created_at,
+            )
+            assistant_message_model = ChatMessage(
+                session_id=session_id,
+                role="assistant",
+                content=answer,
+                created_at=assistant_message_created_at,
+            )
+            session.add_all([user_message_model, assistant_message_model])
+            session.commit()
+
+            summary = self._session_summary_from_model(
+                chat_session,
+                self._count_messages(session, session_id),
+            )
+
         return ChatExchangeResponse(
             session=summary,
-            user_message=user_message,
-            assistant_message=assistant_message,
+            user_message=self._message_record_from_model(user_message_model),
+            assistant_message=self._message_record_from_model(assistant_message_model),
         )
-
-    def get_session_meta(self, session_id: str) -> dict[str, str]:
-        """读取会话元数据，不存在时直接返回 404。"""
-
-        meta = self._get_redis().hgetall(self._session_meta_key(session_id))
-        if not meta:
-            raise HTTPException(status_code=404, detail="会话不存在")
-        return meta
 
     def _validate_settings(self) -> None:
         """启动前校验关键环境变量，避免请求阶段才暴露配置问题。"""
@@ -181,32 +208,21 @@ class ChatService:
             missing.append("DASHSCOPE_API_KEY")
         if not config.DASHSCOPE_BASE_URL:
             missing.append("DASHSCOPE_BASE_URL")
-        if not config.REDIS_URL:
-            missing.append("REDIS_URL")
+        if not config.MYSQL_HOST:
+            missing.append("MYSQL_HOST")
+        if not config.MYSQL_USER:
+            missing.append("MYSQL_USER")
+        if config.MYSQL_PASSWORD is None:
+            missing.append("MYSQL_PASSWORD")
+        if not config.MYSQL_DATABASE:
+            missing.append("MYSQL_DATABASE")
         if missing:
             raise RuntimeError(f"缺少必要环境变量: {', '.join(missing)}")
-
-    def _get_redis(self) -> redis.Redis:
-        if self.redis_client is None:
-            raise RuntimeError("Redis 客户端尚未初始化")
-        return self.redis_client
 
     def _get_chain(self):
         if self.chain is None:
             raise RuntimeError("模型链尚未初始化")
         return self.chain
-
-    def _sessions_index_key(self) -> str:
-        # sorted set 只保存会话 id，用更新时间排序。
-        return f"{config.REDIS_CHAT_HISTORY_PREFIX}:sessions"
-
-    def _session_meta_key(self, session_id: str) -> str:
-        # hash 保存会话标题、创建时间和更新时间。
-        return f"{config.REDIS_CHAT_HISTORY_PREFIX}:session:{session_id}:meta"
-
-    def _session_messages_key(self, session_id: str) -> str:
-        # list 以追加方式保存消息序列，天然适合按时间顺序读取。
-        return f"{config.REDIS_CHAT_HISTORY_PREFIX}:session:{session_id}:messages"
 
     def _build_session_title(self, content: str) -> str:
         normalized = " ".join(content.split())
@@ -214,45 +230,49 @@ class ChatService:
             return "新对话"
         return normalized[:20]
 
-    def _session_summary_from_meta(
-        self, meta: dict[str, str], message_count: int
+    def _normalize_optional_title(self, title: str | None) -> str | None:
+        if title is None:
+            return None
+        normalized = " ".join(title.split())
+        return normalized or None
+
+    def _session_summary_from_model(
+        self, chat_session: ChatSession, message_count: int
     ) -> SessionSummary:
         return SessionSummary(
-            id=meta["id"],
-            title=meta["title"],
-            created_at=meta["created_at"],
-            updated_at=meta["updated_at"],
+            id=chat_session.id,
+            title=chat_session.title,
+            created_at=to_iso_string(chat_session.created_at),
+            updated_at=to_iso_string(chat_session.updated_at),
             message_count=message_count,
         )
 
-    def _load_messages(self, session_id: str) -> list[MessageRecord]:
-        items = self._get_redis().lrange(self._session_messages_key(session_id), 0, -1)
-        return [MessageRecord(**json.loads(item)) for item in items]
+    def _message_record_from_model(self, message: ChatMessage) -> MessageRecord:
+        return MessageRecord(
+            role=message.role, content=message.content, created_at=to_iso_string(message.created_at)
+        )
 
-    def _load_history(self, session_id: str) -> list[dict[str, str]]:
+    def _load_messages(self, session: Session, session_id: str) -> list[MessageRecord]:
+        messages = session.scalars(
+            select(ChatMessage)
+            .where(ChatMessage.session_id == session_id)
+            .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+        ).all()
+        return [self._message_record_from_model(message) for message in messages]
+
+    def _load_history(self, session: Session, session_id: str) -> list[dict[str, str]]:
         return [
             {"role": message.role, "content": message.content}
-            for message in self._load_messages(session_id)
+            for message in self._load_messages(session, session_id)
         ]
 
-    def _append_message(self, session_id: str, role: str, content: str) -> MessageRecord:
-        # 每次写入消息时顺便刷新更新时间，并裁剪历史条数。
-        client = self._get_redis()
-        message = MessageRecord(role=role, content=content, created_at=utc_now())
-        pipeline = client.pipeline()
-        pipeline.rpush(
-            self._session_messages_key(session_id),
-            json.dumps(message.model_dump(), ensure_ascii=False),
-        )
-        pipeline.ltrim(
-            self._session_messages_key(session_id),
-            -config.REDIS_CHAT_HISTORY_LIMIT,
-            -1,
-        )
-        pipeline.hset(
-            self._session_meta_key(session_id),
-            mapping={"updated_at": utc_now()},
-        )
-        pipeline.zadd(self._sessions_index_key(), {session_id: epoch_now()})
-        pipeline.execute()
-        return message
+    def _count_messages(self, session: Session, session_id: str) -> int:
+        return session.scalar(
+            select(func.count(ChatMessage.id)).where(ChatMessage.session_id == session_id)
+        ) or 0
+
+    def _get_session_or_404(self, session: Session, session_id: str) -> ChatSession:
+        chat_session = session.get(ChatSession, session_id)
+        if chat_session is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return chat_session

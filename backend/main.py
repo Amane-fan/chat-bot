@@ -32,7 +32,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup() -> None:
-    """启动时初始化 Redis、模型链和 MySQL 依赖。"""
+    """启动时初始化模型链和 MySQL 依赖。"""
 
     chat_service.startup()
     knowledge_base_service.startup()
