@@ -21,6 +21,10 @@ const loadingSessions = ref(false);
 const sending = ref(false);
 const editingSessionId = ref("");
 const editingTitle = ref("");
+const currentView = ref(getInitialView());
+const chatInitialized = ref(false);
+const knowledgeInitialized = ref(false);
+const sessionListCollapsed = ref(false);
 
 const knowledgeBases = ref([]);
 const knowledgeBasePage = ref(1);
@@ -43,6 +47,23 @@ const activeSession = computed(
 const knowledgeBaseTotalPages = computed(() =>
   Math.max(1, Math.ceil(knowledgeBaseTotal.value / knowledgeBasePageSize.value)),
 );
+
+function getInitialView() {
+  if (typeof window === "undefined") {
+    return "chat";
+  }
+  return window.location.hash === "#knowledge" ? "knowledge" : "chat";
+}
+
+function syncViewHash(view) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  const nextHash = view === "knowledge" ? "#knowledge" : "#chat";
+  if (window.location.hash !== nextHash) {
+    window.history.replaceState(null, "", nextHash);
+  }
+}
 
 async function loadSessions(preferredSessionId = "") {
   loadingSessions.value = true;
@@ -93,6 +114,7 @@ async function loadKnowledgeBases(page = knowledgeBasePage.value) {
     knowledgeBases.value = data.items;
     knowledgeBasePage.value = data.page;
     knowledgeBaseTotal.value = data.total;
+    knowledgeInitialized.value = true;
   } catch (error) {
     errorMessage.value = error.message;
   } finally {
@@ -120,6 +142,7 @@ async function handleCreateSession() {
     activeSessionId.value = session.id;
     messages.value = [];
     draft.value = "";
+    chatInitialized.value = true;
   } catch (error) {
     errorMessage.value = error.message;
   }
@@ -243,6 +266,44 @@ async function changeKnowledgeBasePage(nextPage) {
   await loadKnowledgeBases(nextPage);
 }
 
+async function initializeChatView() {
+  if (chatInitialized.value) {
+    return;
+  }
+
+  await loadSessions();
+  if (!sessions.value.length) {
+    await handleCreateSession();
+  } else {
+    await loadMessagesForSession(activeSessionId.value);
+  }
+  chatInitialized.value = true;
+}
+
+async function initializeKnowledgeView() {
+  if (knowledgeInitialized.value) {
+    return;
+  }
+  await loadKnowledgeBases();
+}
+
+async function switchView(view) {
+  currentView.value = view;
+  syncViewHash(view);
+  errorMessage.value = "";
+
+  if (view === "chat") {
+    await initializeChatView();
+    return;
+  }
+
+  await initializeKnowledgeView();
+}
+
+function toggleSessionList() {
+  sessionListCollapsed.value = !sessionListCollapsed.value;
+}
+
 function formatTime(value) {
   return new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit",
@@ -267,12 +328,7 @@ function formatKnowledgeBaseConfig(config) {
 }
 
 onMounted(async () => {
-  await Promise.all([loadSessions(), loadKnowledgeBases()]);
-  if (!sessions.value.length) {
-    await handleCreateSession();
-    return;
-  }
-  await loadMessagesForSession(activeSessionId.value);
+  await switchView(currentView.value);
 });
 </script>
 
@@ -281,63 +337,190 @@ onMounted(async () => {
     <aside class="sidebar">
       <div class="brand">
         <p class="eyebrow">Impression Study</p>
-        <h1>对话与知识库控制台</h1>
+        <h1>对话与知识库工作台</h1>
         <p class="brand-copy">
-          聊天会话继续保存在 Redis，知识库元数据通过 MySQL 管理；同一界面里分别处理对话和知识库准备工作。
+          把即时对话和知识库准备拆成两块独立界面。当前只专注一个任务，减少同屏干扰。
         </p>
       </div>
 
-      <div class="sidebar-sections">
-        <section class="session-panel">
-          <div class="panel-header">
-            <span>会话列表</span>
-            <span v-if="loadingSessions">同步中</span>
+      <nav class="view-switcher" aria-label="工作区切换">
+        <button
+          class="view-button"
+          :class="{ active: currentView === 'chat' }"
+          @click="switchView('chat')"
+        >
+          <span>聊天界面</span>
+          <small>会话、消息、模型回复</small>
+        </button>
+        <button
+          class="view-button"
+          :class="{ active: currentView === 'knowledge' }"
+          @click="switchView('knowledge')"
+        >
+          <span>知识库界面</span>
+          <small>元数据、配置、分页列表</small>
+        </button>
+      </nav>
+
+      <div class="sidebar-cards">
+        <article class="sidebar-card">
+          <span>会话数</span>
+          <strong>{{ sessions.length }}</strong>
+          <p>当前聊天工作区会维护最近活跃会话。</p>
+        </article>
+        <article class="sidebar-card">
+          <span>知识库数</span>
+          <strong>{{ knowledgeBaseTotal }}</strong>
+          <p>知识库界面单独负责元数据创建与管理。</p>
+        </article>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <section v-if="currentView === 'chat'" class="view-stage chat-stage">
+        <div class="floating-study study-a" aria-hidden="true"></div>
+        <div class="floating-study study-b" aria-hidden="true"></div>
+
+        <header class="stage-header">
+          <div>
+            <p class="eyebrow chat-eyebrow">Conversation Atelier</p>
+            <h2>{{ activeSession?.title || "聊天界面" }}</h2>
           </div>
+          <p class="hint">只保留会话和消息流，让当前对话像一张独立展墙。</p>
+        </header>
 
-          <button class="primary-button" @click="handleCreateSession">新建会话</button>
-
-          <article
-            v-for="session in sessions"
-            :key="session.id"
-            class="session-card"
-            :class="{ active: session.id === activeSessionId }"
-            @click="handleSelectSession(session.id)"
-          >
-            <div class="session-copy">
-              <template v-if="editingSessionId === session.id">
-                <input
-                  v-model="editingTitle"
-                  class="session-input"
-                  maxlength="80"
-                  @click.stop
-                  @keydown.enter.prevent="submitRename(session.id)"
-                  @blur="submitRename(session.id)"
-                />
-              </template>
-              <template v-else>
-                <strong>{{ session.title }}</strong>
-                <span>{{ session.message_count }} 条消息</span>
-              </template>
-            </div>
-            <div class="session-actions">
-              <span>{{ formatTime(session.updated_at) }}</span>
-              <div class="mini-actions">
-                <button class="ghost-button" @click.stop="startRename(session)">重命名</button>
-                <button class="ghost-button danger" @click.stop="handleDeleteSession(session.id)">
-                  删除
+        <div class="chat-layout" :class="{ 'sessions-collapsed': sessionListCollapsed }">
+          <section class="session-panel session-stage" :class="{ collapsed: sessionListCollapsed }">
+            <div class="panel-header">
+              <span>{{ sessionListCollapsed ? "会话" : "会话列表" }}</span>
+              <div class="panel-tools">
+                <span v-if="loadingSessions">同步中</span>
+                <button
+                  class="panel-toggle"
+                  :aria-expanded="(!sessionListCollapsed).toString()"
+                  :aria-label="sessionListCollapsed ? '展开会话列表' : '收起会话列表'"
+                  @click="toggleSessionList"
+                >
+                  {{ sessionListCollapsed ? "›" : "‹" }}
                 </button>
               </div>
             </div>
-          </article>
-        </section>
 
-        <section class="knowledge-panel">
-          <div class="panel-header">
-            <span>知识库工坊</span>
-            <span>{{ knowledgeBaseTotal }} 个</span>
+            <div v-if="sessionListCollapsed" class="session-collapsed-summary">
+              <strong>{{ sessions.length }}</strong>
+              <span>条会话</span>
+            </div>
+
+            <div v-else class="session-panel-body">
+              <button class="primary-button" @click="handleCreateSession">新建会话</button>
+
+              <div class="session-list">
+                <article
+                  v-for="session in sessions"
+                  :key="session.id"
+                  class="session-card"
+                  :class="{ active: session.id === activeSessionId }"
+                  @click="handleSelectSession(session.id)"
+                >
+                  <div class="session-copy">
+                    <template v-if="editingSessionId === session.id">
+                      <input
+                        v-model="editingTitle"
+                        class="session-input"
+                        maxlength="80"
+                        @click.stop
+                        @keydown.enter.prevent="submitRename(session.id)"
+                        @blur="submitRename(session.id)"
+                      />
+                    </template>
+                    <template v-else>
+                      <strong>{{ session.title }}</strong>
+                      <span>{{ session.message_count }} 条消息</span>
+                    </template>
+                  </div>
+                  <div class="session-actions">
+                    <span>{{ formatTime(session.updated_at) }}</span>
+                    <div class="mini-actions">
+                      <button class="ghost-button" @click.stop="startRename(session)">重命名</button>
+                      <button class="ghost-button danger" @click.stop="handleDeleteSession(session.id)">
+                        删除
+                      </button>
+                    </div>
+                  </div>
+                </article>
+              </div>
+            </div>
+          </section>
+
+          <section class="conversation-panel">
+            <div class="panel-header">
+              <span>消息窗口</span>
+              <span v-if="loadingMessages">加载中</span>
+            </div>
+
+            <div class="message-wall">
+              <div v-if="loadingMessages" class="placeholder">正在加载消息...</div>
+              <div v-else-if="!messages.length" class="placeholder">
+                这是一个空白会话。发第一条消息后，标题会自动取自首句内容。
+              </div>
+              <article
+                v-for="message in messages"
+                :key="`${message.created_at}-${message.role}-${message.content}`"
+                class="message-card"
+                :class="message.role"
+              >
+                <div class="message-meta">
+                  <time>{{ formatTime(message.created_at) }}</time>
+                </div>
+                <p>{{ message.content }}</p>
+              </article>
+            </div>
+
+            <footer class="composer">
+              <div v-if="errorMessage" class="error-banner">{{ errorMessage }}</div>
+              <textarea
+                v-model="draft"
+                class="composer-input"
+                placeholder="输入消息，回车发送，Shift + Enter 换行"
+                rows="4"
+                @keydown.enter.exact.prevent="handleSendMessage"
+              />
+              <div class="composer-actions">
+                <span>FastAPI + Vue + Redis</span>
+                <button
+                  class="primary-button composer-button"
+                  :disabled="sending"
+                  @click="handleSendMessage"
+                >
+                  {{ sending ? "发送中..." : "发送消息" }}
+                </button>
+              </div>
+            </footer>
+          </section>
+        </div>
+      </section>
+
+      <section v-else class="view-stage knowledge-stage">
+        <div class="floating-study study-b" aria-hidden="true"></div>
+        <div class="floating-study study-c" aria-hidden="true"></div>
+
+        <header class="stage-header">
+          <div>
+            <p class="eyebrow chat-eyebrow">Knowledge Studio</p>
+            <h2>知识库界面</h2>
           </div>
+          <p class="hint">把知识库创建、分页浏览和配置编辑单独留在一个更安静的空间里。</p>
+        </header>
 
-          <div class="knowledge-shell">
+        <div class="knowledge-workspace">
+          <section class="knowledge-panel knowledge-editor">
+            <div class="panel-header">
+              <span>知识库工坊</span>
+              <span>{{ knowledgeBaseTotal }} 个</span>
+            </div>
+
+            <div v-if="errorMessage" class="error-banner">{{ errorMessage }}</div>
+
             <form class="knowledge-form" @submit.prevent="handleCreateKnowledgeBase">
               <label class="field-label">
                 <span>知识库名称</span>
@@ -354,7 +537,7 @@ onMounted(async () => {
                 <textarea
                   v-model="knowledgeBaseForm.description"
                   class="field-input field-area"
-                  rows="3"
+                  rows="4"
                   placeholder="说明这个知识库的内容范围和用途"
                 />
               </label>
@@ -403,13 +586,15 @@ onMounted(async () => {
                 {{ creatingKnowledgeBase ? "创建中..." : "创建知识库" }}
               </button>
             </form>
+          </section>
 
-            <div class="knowledge-list">
-              <div class="knowledge-list-header">
-                <strong>分页列表</strong>
-                <span v-if="loadingKnowledgeBases">加载中</span>
-              </div>
+          <section class="knowledge-panel knowledge-library">
+            <div class="knowledge-list-header">
+              <strong>分页列表</strong>
+              <span v-if="loadingKnowledgeBases">加载中</span>
+            </div>
 
+            <div class="knowledge-list-scroll">
               <div v-if="!knowledgeBases.length && !loadingKnowledgeBases" class="knowledge-empty">
                 还没有知识库。先创建一个元数据入口，后续再接文档上传和检索。
               </div>
@@ -425,77 +610,28 @@ onMounted(async () => {
                   <time>{{ formatTime(item.created_at) }}</time>
                 </div>
               </article>
-
-              <div class="pager">
-                <button
-                  class="pager-button"
-                  :disabled="knowledgeBasePage <= 1"
-                  @click="changeKnowledgeBasePage(knowledgeBasePage - 1)"
-                >
-                  上一页
-                </button>
-                <span>第 {{ knowledgeBasePage }} / {{ knowledgeBaseTotalPages }} 页</span>
-                <button
-                  class="pager-button"
-                  :disabled="knowledgeBasePage >= knowledgeBaseTotalPages"
-                  @click="changeKnowledgeBasePage(knowledgeBasePage + 1)"
-                >
-                  下一页
-                </button>
-              </div>
             </div>
-          </div>
-        </section>
-      </div>
-    </aside>
 
-    <main class="chat-stage">
-      <div class="floating-study study-a" aria-hidden="true"></div>
-      <div class="floating-study study-b" aria-hidden="true"></div>
-      <div class="floating-study study-c" aria-hidden="true"></div>
-
-      <header class="chat-header">
-        <div>
-          <p class="eyebrow chat-eyebrow">Monet Light</p>
-          <h2>{{ activeSession?.title || "未选择会话" }}</h2>
+            <div class="pager">
+              <button
+                class="pager-button"
+                :disabled="knowledgeBasePage <= 1"
+                @click="changeKnowledgeBasePage(knowledgeBasePage - 1)"
+              >
+                上一页
+              </button>
+              <span>第 {{ knowledgeBasePage }} / {{ knowledgeBaseTotalPages }} 页</span>
+              <button
+                class="pager-button"
+                :disabled="knowledgeBasePage >= knowledgeBaseTotalPages"
+                @click="changeKnowledgeBasePage(knowledgeBasePage + 1)"
+              >
+                下一页
+              </button>
+            </div>
+          </section>
         </div>
-        <p class="hint">像在展墙上整理画片一样组织会话、消息与知识库条目。</p>
-      </header>
-
-      <div class="message-wall">
-        <div v-if="loadingMessages" class="placeholder">正在加载消息...</div>
-        <div v-else-if="!messages.length" class="placeholder">
-          这是一个空白会话。发第一条消息后，标题会自动取自首句内容。
-        </div>
-        <article
-          v-for="message in messages"
-          :key="`${message.created_at}-${message.role}-${message.content}`"
-          class="message-card"
-          :class="message.role"
-        >
-          <div class="message-meta">
-            <time>{{ formatTime(message.created_at) }}</time>
-          </div>
-          <p>{{ message.content }}</p>
-        </article>
-      </div>
-
-      <footer class="composer">
-        <div v-if="errorMessage" class="error-banner">{{ errorMessage }}</div>
-        <textarea
-          v-model="draft"
-          class="composer-input"
-          placeholder="输入消息，回车发送，Shift + Enter 换行"
-          rows="4"
-          @keydown.enter.exact.prevent="handleSendMessage"
-        />
-        <div class="composer-actions">
-          <span>FastAPI + Vue + Redis + MySQL</span>
-          <button class="primary-button composer-button" :disabled="sending" @click="handleSendMessage">
-            {{ sending ? "发送中..." : "发送消息" }}
-          </button>
-        </div>
-      </footer>
+      </section>
     </main>
   </div>
 </template>
