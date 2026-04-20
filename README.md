@@ -38,8 +38,10 @@
 │       ├── App.vue
 │       ├── api.js
 │       └── style.css
+├── .python-version
 ├── .env.example
-├── requirements.txt
+├── pyproject.toml
+├── uv.lock
 └── README.md
 ```
 
@@ -85,9 +87,13 @@ VITE_API_BASE_URL=http://localhost:8000/api
 后端：
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv sync
+```
+
+如果本机还没有安装 `uv`，先执行：
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 前端：
@@ -124,7 +130,7 @@ redis-server
 启动后端。
 
 ```bash
-uvicorn backend.main:app --reload
+uv run uvicorn backend.main:app --reload
 ```
 
 启动前端。

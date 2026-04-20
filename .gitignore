@@ -1,14 +1,18 @@
+# Environment files
 .env
 .env.*
 !.env.example
 !frontend/.env.example
+
+# Python virtual environments
 .venv/
 venv/
+.Python
+
+# Python caches and build artifacts
 __pycache__/
 *.py[cod]
 *.so
-*.log
-.Python
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -18,12 +22,24 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+
+# Frontend dependencies and build output
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor and OS files
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
+
 # Local Codex metadata
 .codex
-node_modules/
-frontend/dist/
-frontend/.vite/
