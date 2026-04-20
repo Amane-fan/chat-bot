@@ -280,7 +280,7 @@ onMounted(async () => {
   <div class="shell">
     <aside class="sidebar">
       <div class="brand">
-        <p class="eyebrow">Session + Knowledge</p>
+        <p class="eyebrow">Impression Study</p>
         <h1>对话与知识库控制台</h1>
         <p class="brand-copy">
           聊天会话继续保存在 Redis，知识库元数据通过 MySQL 管理；同一界面里分别处理对话和知识库准备工作。
@@ -450,12 +450,16 @@ onMounted(async () => {
     </aside>
 
     <main class="chat-stage">
+      <div class="floating-study study-a" aria-hidden="true"></div>
+      <div class="floating-study study-b" aria-hidden="true"></div>
+      <div class="floating-study study-c" aria-hidden="true"></div>
+
       <header class="chat-header">
         <div>
-          <p class="eyebrow chat-eyebrow">Active Session</p>
+          <p class="eyebrow chat-eyebrow">Monet Light</p>
           <h2>{{ activeSession?.title || "未选择会话" }}</h2>
         </div>
-        <p class="hint">知识库在左侧准备，右侧仍专注当前会话的消息交互。</p>
+        <p class="hint">像在展墙上整理画片一样组织会话、消息与知识库条目。</p>
       </header>
 
       <div class="message-wall">
