@@ -1,6 +1,7 @@
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import HTTPException
 from langchain_core.output_parsers import StrOutputParser
@@ -18,6 +19,14 @@ from backend.schemas import (
     KnowledgeBaseReference,
     MessageRecord,
     SessionSummary,
+)
+from backend.services.knowledge_base_service import KnowledgeBaseService
+
+
+BASE_SYSTEM_PROMPT = "你是一个智能助手，热情耐心地回答用户的问题。"
+KNOWLEDGE_SYSTEM_INSTRUCTION = (
+    "仅在相关时参考以下知识库内容；如果知识库资料不足或没有覆盖问题，"
+    "请明确说明无法从知识库确认，并基于通用知识谨慎回答。"
 )
 
 
@@ -38,8 +47,9 @@ def to_iso_string(value: datetime) -> str:
 class ChatService:
     """封装 MySQL 会话存储和模型链，供路由层直接调用。"""
 
-    def __init__(self) -> None:
+    def __init__(self, knowledge_base_service: KnowledgeBaseService | None = None) -> None:
         self.chain = None
+        self.knowledge_base_service = knowledge_base_service
 
     def startup(self) -> None:
         """应用启动时初始化依赖，避免在模块导入阶段直接失败。"""
@@ -65,7 +75,7 @@ class ChatService:
 
         prompt = ChatPromptTemplate.from_messages(
             [
-                ("system", "你是一个智能助手，热情耐心地回答用户的问题。"),
+                ("system", "{system_prompt}"),
                 MessagesPlaceholder("history", optional=True),
                 ("human", "{question}"),
             ]
@@ -195,10 +205,22 @@ class ChatService:
         with session_factory() as session:
             self._get_session_or_404(session, session_id)
             history = self._load_history(session, session_id)
+            knowledge_bases = self._list_knowledge_bases_for_sessions(
+                session, [session_id]
+            ).get(session_id, [])
+
+        retrieved_chunks = self._retrieve_knowledge_chunks(
+            normalized_content, knowledge_bases
+        )
+        system_prompt = self._build_system_prompt(retrieved_chunks)
 
         try:
             answer = self._get_chain().invoke(
-                {"question": normalized_content, "history": history}
+                {
+                    "system_prompt": system_prompt,
+                    "question": normalized_content,
+                    "history": history,
+                }
             )
         except Exception as exc:
             raise HTTPException(status_code=502, detail="模型调用失败") from exc
@@ -262,6 +284,50 @@ class ChatService:
         if self.chain is None:
             raise RuntimeError("模型链尚未初始化")
         return self.chain
+
+    def _retrieve_knowledge_chunks(
+        self, question: str, knowledge_bases: list[KnowledgeBaseReference]
+    ) -> list[dict[str, Any]]:
+        if self.knowledge_base_service is None or not knowledge_bases:
+            return []
+        try:
+            return self.knowledge_base_service.retrieve_relevant_chunks(
+                question, knowledge_bases
+            )
+        except Exception:
+            # 知识库检索失败不影响基础聊天，避免一次 Qdrant/Embedding 波动阻断问答。
+            return []
+
+    def _build_system_prompt(self, retrieved_chunks: list[dict[str, Any]]) -> str:
+        if not retrieved_chunks:
+            return BASE_SYSTEM_PROMPT
+
+        context_blocks = []
+        for index, chunk in enumerate(retrieved_chunks, start=1):
+            source = chunk.get("original_filename") or "未知文档"
+            knowledge_base_name = chunk.get("knowledge_base_name") or "未知知识库"
+            chunk_index = chunk.get("chunk_index")
+            context_blocks.append(
+                "\n".join(
+                    [
+                        f"[片段 {index}]",
+                        f"知识库：{knowledge_base_name}",
+                        f"来源文档：{source}",
+                        f"分块序号：{chunk_index}",
+                        f"内容：{chunk.get('text') or ''}",
+                    ]
+                )
+            )
+
+        # 把检索结果作为动态系统上下文交给模型，避免污染持久化聊天历史。
+        return "\n\n".join(
+            [
+                BASE_SYSTEM_PROMPT,
+                KNOWLEDGE_SYSTEM_INSTRUCTION,
+                "以下是从当前会话绑定知识库中检索到的参考内容：",
+                "\n\n".join(context_blocks),
+            ]
+        )
 
     def _build_session_title(self, content: str) -> str:
         normalized = " ".join(content.split())

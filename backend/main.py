@@ -21,8 +21,8 @@ from backend.services.chat_service import ChatService
 from backend.services.knowledge_base_service import KnowledgeBaseService
 
 # Service 层负责状态和业务逻辑，路由层只做请求分发和参数校验。
-chat_service = ChatService()
 knowledge_base_service = KnowledgeBaseService()
+chat_service = ChatService(knowledge_base_service)
 
 app = FastAPI(title="Session Chat & Knowledge Base API")
 app.add_middleware(
@@ -38,8 +38,8 @@ app.add_middleware(
 def on_startup() -> None:
     """启动时初始化模型链和 MySQL 依赖。"""
 
-    chat_service.startup()
     knowledge_base_service.startup()
+    chat_service.startup()
 
 
 @app.get("/api/health")

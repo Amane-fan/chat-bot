@@ -25,6 +25,8 @@ from backend.schemas import (
 DEFAULT_EMBEDDING_MODEL = "text-embedding-v1"
 DEFAULT_CHUNK_SIZE = 500
 DEFAULT_CHUNK_OVERLAP = 50
+DEFAULT_RETRIEVAL_TOP_K = 3
+DEFAULT_RETRIEVAL_CONTEXT_CHAR_LIMIT = 6000
 PROCESSING_STATUS = "processing"
 READY_STATUS = "ready"
 FAILED_STATUS = "failed"
@@ -245,6 +247,76 @@ class KnowledgeBaseService:
             knowledge_base_id=knowledge_base_id,
             items=[self._to_document_summary(item) for item in items],
         )
+
+    def retrieve_relevant_chunks(
+        self,
+        question: str,
+        knowledge_bases: list[KnowledgeBaseReference],
+        *,
+        top_k: int = DEFAULT_RETRIEVAL_TOP_K,
+        context_char_limit: int = DEFAULT_RETRIEVAL_CONTEXT_CHAR_LIMIT,
+    ) -> list[dict[str, Any]]:
+        """按会话绑定知识库检索和问题最相关的文本块。"""
+
+        normalized_question = question.strip()
+        if not normalized_question or not knowledge_bases:
+            return []
+
+        session_factory = get_session_factory()
+        knowledge_base_ids = [item.id for item in knowledge_bases]
+        with session_factory() as session:
+            items = session.scalars(
+                select(KnowledgeBase).where(KnowledgeBase.id.in_(knowledge_base_ids))
+            ).all()
+
+        knowledge_base_map = {item.id: item for item in items}
+        retrieved_chunks: list[dict[str, Any]] = []
+        used_chars = 0
+
+        for knowledge_base_ref in knowledge_bases:
+            knowledge_base = knowledge_base_map.get(knowledge_base_ref.id)
+            if knowledge_base is None or knowledge_base.document_count <= 0:
+                continue
+
+            try:
+                query_vector = self._embed_query(
+                    dict(knowledge_base.config or {}), normalized_question
+                )
+                hits = self._query_knowledge_base_chunks(
+                    knowledge_base.id, query_vector, top_k
+                )
+            except Exception:
+                # 检索增强是可选上下文，单个知识库失败时保留普通聊天能力。
+                continue
+
+            for hit in hits:
+                payload = hit.payload or {}
+                text = str(payload.get("text") or "").strip()
+                if not text:
+                    continue
+
+                remaining_chars = context_char_limit - used_chars
+                if remaining_chars <= 0:
+                    return retrieved_chunks
+
+                truncated_text = text[:remaining_chars]
+                used_chars += len(truncated_text)
+                retrieved_chunks.append(
+                    {
+                        "knowledge_base_id": knowledge_base.id,
+                        "knowledge_base_name": knowledge_base_ref.name,
+                        "document_id": payload.get("document_id"),
+                        "original_filename": payload.get("original_filename"),
+                        "chunk_index": payload.get("chunk_index"),
+                        "score": getattr(hit, "score", None),
+                        "text": truncated_text,
+                    }
+                )
+
+                if used_chars >= context_char_limit:
+                    return retrieved_chunks
+
+        return retrieved_chunks
 
     def upload_knowledge_base_document(
         self, knowledge_base_id: str, file: UploadFile
@@ -484,21 +556,29 @@ class KnowledgeBaseService:
     def _embed_document_chunks(
         self, knowledge_base_config: dict[str, Any], chunks: list[str]
     ) -> list[list[float]]:
+        embeddings = self._build_embeddings(knowledge_base_config)
+        try:
+            return embeddings.embed_documents(chunks)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"文档向量化失败: {exc}") from exc
+
+    def _embed_query(
+        self, knowledge_base_config: dict[str, Any], question: str
+    ) -> list[float]:
+        embeddings = self._build_embeddings(knowledge_base_config)
+        return embeddings.embed_query(question)
+
+    def _build_embeddings(self, knowledge_base_config: dict[str, Any]) -> OpenAIEmbeddings:
         embedding_model = (
             knowledge_base_config.get("embedding_model") or DEFAULT_EMBEDDING_MODEL
         )
-        embeddings = OpenAIEmbeddings(
+        return OpenAIEmbeddings(
             model=embedding_model,
             api_key=config.DASHSCOPE_API_KEY,
             base_url=config.EMBEDDING_BASE_URL,
             chunk_size=10,                   # 关键：限制每次最多 10 条
             check_embedding_ctx_length=False, # 对兼容 OpenAI 的非 OpenAI 提供方更稳妥
         )
-        try:
-            return embeddings.embed_documents(chunks)
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"文档向量化失败: {exc}") from exc
-
 
     def _ensure_collection(self, collection_name: str, vector_size: int) -> None:
         client = self._get_qdrant_client()
@@ -525,6 +605,23 @@ class KnowledgeBaseService:
             return True
         except Exception:
             return False
+
+    def _query_knowledge_base_chunks(
+        self, knowledge_base_id: str, query_vector: list[float], top_k: int
+    ) -> list[Any]:
+        collection_name = self._collection_name(knowledge_base_id)
+        if not self._collection_exists(collection_name):
+            return []
+
+        # 本项目锁定的 qdrant-client 使用 query_points 作为向量检索入口。
+        response = self._get_qdrant_client().query_points(
+            collection_name=collection_name,
+            query=query_vector,
+            limit=top_k,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return list(response.points or [])
 
     def _upsert_document_chunks(
         self,
