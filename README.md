@@ -6,8 +6,6 @@
 
 ## 预览
 
-> 前端预览图预留位置。后续可以将截图保存为 `docs/images/app-preview.png`，下方图片会自动显示。
-
 ![知答舱前端预览](docs/images/app-preview.png)
 
 ## 功能特性
