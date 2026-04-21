@@ -1,5 +1,3 @@
-import json
-import logging
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -32,10 +30,6 @@ KNOWLEDGE_SYSTEM_INSTRUCTION = (
     "请明确说明无法从知识库确认，并基于通用知识谨慎回答。"
     "回答中引用知识库内容时，请使用 [来源 1] 这样的来源编号。"
 )
-# 复用 uvicorn 控制台日志通道，确保本地 `uvicorn ... --reload` 时能直接看到。
-logger = logging.getLogger("uvicorn.error")
-logger.setLevel(logging.INFO)
-
 
 def utc_now() -> datetime:
     """MySQL DATETIME 不带时区，这里统一存 UTC naive datetime。"""
@@ -225,9 +219,6 @@ class ChatService:
             "question": normalized_content,
             "history": history,
         }
-        self._log_llm_payload(
-            session_id, knowledge_bases, retrieved_chunks, llm_payload
-        )
 
         try:
             answer = self._get_chain().invoke(llm_payload)
@@ -296,25 +287,6 @@ class ChatService:
         if self.chain is None:
             raise RuntimeError("模型链尚未初始化")
         return self.chain
-
-    def _log_llm_payload(
-        self,
-        session_id: str,
-        knowledge_bases: list[KnowledgeBaseReference],
-        retrieved_chunks: list[dict[str, Any]],
-        payload: dict[str, Any],
-    ) -> None:
-        # 调试实际发送给大模型的上下文；日志会包含用户消息和知识库片段。
-        log_payload = {
-            "session_id": session_id,
-            "knowledge_bases": [item.name for item in knowledge_bases],
-            "retrieved_chunk_count": len(retrieved_chunks),
-            "llm_payload": payload,
-        }
-        logger.info(
-            "发送给大模型的内容:\n%s",
-            json.dumps(log_payload, ensure_ascii=False, indent=2),
-        )
 
     def _retrieve_knowledge_chunks(
         self, question: str, knowledge_bases: list[KnowledgeBaseReference]
