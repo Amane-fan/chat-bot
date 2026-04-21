@@ -3,12 +3,25 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+class KnowledgeBaseRetrievedChunk(BaseModel):
+    """一次问答中命中的知识库片段。"""
+
+    knowledge_base_id: str
+    knowledge_base_name: str
+    document_id: str | None = None
+    original_filename: str | None = None
+    chunk_index: int | None = None
+    score: float | None = None
+    text: str
+
+
 class MessageRecord(BaseModel):
     """单条聊天消息。"""
 
     role: Literal["user", "assistant"]
     content: str
     created_at: str
+    retrieved_chunks: list[KnowledgeBaseRetrievedChunk] = Field(default_factory=list)
 
 
 class KnowledgeBaseReference(BaseModel):

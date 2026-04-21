@@ -18,6 +18,7 @@ from backend.db import get_engine, get_session_factory, init_mysql
 from backend.models import ChatMessage, ChatSession, KnowledgeBase, SessionKnowledgeBase
 from backend.schemas import (
     ChatExchangeResponse,
+    KnowledgeBaseRetrievedChunk,
     KnowledgeBaseReference,
     MessageRecord,
     SessionSummary,
@@ -29,6 +30,7 @@ BASE_SYSTEM_PROMPT = "你是一个智能助手，热情耐心地回答用户的�
 KNOWLEDGE_SYSTEM_INSTRUCTION = (
     "仅在相关时参考以下知识库内容；如果知识库资料不足或没有覆盖问题，"
     "请明确说明无法从知识库确认，并基于通用知识谨慎回答。"
+    "回答中引用知识库内容时，请使用 [来源 1] 这样的来源编号。"
 )
 # 复用 uvicorn 控制台日志通道，确保本地 `uvicorn ... --reload` 时能直接看到。
 logger = logging.getLogger("uvicorn.error")
@@ -231,6 +233,7 @@ class ChatService:
             answer = self._get_chain().invoke(llm_payload)
         except Exception as exc:
             raise HTTPException(status_code=502, detail="模型调用失败") from exc
+        answer = self._append_reference_section(answer, retrieved_chunks)
 
         user_message_created_at = utc_now()
         assistant_message_created_at = utc_now()
@@ -265,7 +268,9 @@ class ChatService:
         return ChatExchangeResponse(
             session=summary,
             user_message=self._message_record_from_model(user_message_model),
-            assistant_message=self._message_record_from_model(assistant_message_model),
+            assistant_message=self._message_record_from_model(
+                assistant_message_model, retrieved_chunks
+            ),
         )
 
     def _validate_settings(self) -> None:
@@ -336,7 +341,7 @@ class ChatService:
             context_blocks.append(
                 "\n".join(
                     [
-                        f"[片段 {index}]",
+                        f"[来源 {index}]",
                         f"知识库：{knowledge_base_name}",
                         f"来源文档：{source}",
                         f"分块序号：{chunk_index}",
@@ -354,6 +359,48 @@ class ChatService:
                 "\n\n".join(context_blocks),
             ]
         )
+
+    def _append_reference_section(
+        self, answer: str, retrieved_chunks: list[dict[str, Any]]
+    ) -> str:
+        if not retrieved_chunks:
+            return answer
+
+        seen_sources: set[tuple[str, str, str]] = set()
+        reference_lines: list[str] = []
+        for index, chunk in enumerate(retrieved_chunks, start=1):
+            knowledge_base_name = str(chunk.get("knowledge_base_name") or "未知知识库")
+            filename = str(chunk.get("original_filename") or "未知文档")
+            chunk_index = str(chunk.get("chunk_index"))
+            source_key = (knowledge_base_name, filename, chunk_index)
+            if source_key in seen_sources:
+                continue
+            seen_sources.add(source_key)
+            reference_lines.append(
+                f"[来源 {index}] {knowledge_base_name} / {filename} / chunk {chunk_index}"
+            )
+
+        if not reference_lines:
+            return answer
+        return f"{answer.rstrip()}\n\n参考来源：\n" + "\n".join(reference_lines)
+
+    def _to_retrieved_chunk_records(
+        self, retrieved_chunks: list[dict[str, Any]]
+    ) -> list[KnowledgeBaseRetrievedChunk]:
+        records = []
+        for chunk in retrieved_chunks:
+            records.append(
+                KnowledgeBaseRetrievedChunk(
+                    knowledge_base_id=str(chunk.get("knowledge_base_id") or ""),
+                    knowledge_base_name=str(chunk.get("knowledge_base_name") or ""),
+                    document_id=chunk.get("document_id"),
+                    original_filename=chunk.get("original_filename"),
+                    chunk_index=chunk.get("chunk_index"),
+                    score=chunk.get("score"),
+                    text=str(chunk.get("text") or ""),
+                )
+            )
+        return records
 
     def _build_session_title(self, content: str) -> str:
         normalized = " ".join(content.split())
@@ -382,9 +429,16 @@ class ChatService:
             knowledge_bases=knowledge_bases,
         )
 
-    def _message_record_from_model(self, message: ChatMessage) -> MessageRecord:
+    def _message_record_from_model(
+        self,
+        message: ChatMessage,
+        retrieved_chunks: list[dict[str, Any]] | None = None,
+    ) -> MessageRecord:
         return MessageRecord(
-            role=message.role, content=message.content, created_at=to_iso_string(message.created_at)
+            role=message.role,
+            content=message.content,
+            created_at=to_iso_string(message.created_at),
+            retrieved_chunks=self._to_retrieved_chunk_records(retrieved_chunks or []),
         )
 
     def _load_messages(self, session: Session, session_id: str) -> list[MessageRecord]:

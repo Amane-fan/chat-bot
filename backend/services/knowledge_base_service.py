@@ -1,4 +1,7 @@
+import json
+import logging
 import re
+import time
 import uuid
 from io import BytesIO
 from pathlib import Path
@@ -28,11 +31,14 @@ DEFAULT_CHUNK_SIZE = 500
 DEFAULT_CHUNK_OVERLAP = 50
 DEFAULT_RETRIEVAL_TOP_K = 3
 DEFAULT_RETRIEVAL_CONTEXT_CHAR_LIMIT = 6000
+DEFAULT_RETRIEVAL_SCORE_THRESHOLD = 0.25
 PROCESSING_STATUS = "processing"
 READY_STATUS = "ready"
 FAILED_STATUS = "failed"
 ALLOWED_DOCUMENT_EXTENSIONS = {".txt", ".md", ".pdf"}
 DEFAULT_SEPARATORS = ["\n\n", "\n", " ", ""]
+logger = logging.getLogger("uvicorn.error")
+logger.setLevel(logging.INFO)
 
 
 def utc_now():
@@ -256,6 +262,7 @@ class KnowledgeBaseService:
         *,
         top_k: int = DEFAULT_RETRIEVAL_TOP_K,
         context_char_limit: int = DEFAULT_RETRIEVAL_CONTEXT_CHAR_LIMIT,
+        score_threshold: float | None = DEFAULT_RETRIEVAL_SCORE_THRESHOLD,
     ) -> list[dict[str, Any]]:
         """按会话绑定知识库检索和问题最相关的文本块。"""
 
@@ -266,47 +273,85 @@ class KnowledgeBaseService:
         session_factory = get_session_factory()
         knowledge_base_ids = [item.id for item in knowledge_bases]
         with session_factory() as session:
-            rows = session.execute(
+            items = session.scalars(
+                select(KnowledgeBase).where(KnowledgeBase.id.in_(knowledge_base_ids))
+            ).all()
+            ready_document_rows = session.execute(
                 select(
-                    KnowledgeBase,
-                    func.count(KnowledgeBaseDocument.id).label("ready_document_count"),
+                    KnowledgeBaseDocument.knowledge_base_id,
+                    KnowledgeBaseDocument.id,
                 )
-                .outerjoin(
-                    KnowledgeBaseDocument,
-                    (KnowledgeBaseDocument.knowledge_base_id == KnowledgeBase.id)
-                    & (KnowledgeBaseDocument.status == READY_STATUS),
+                .where(
+                    KnowledgeBaseDocument.knowledge_base_id.in_(knowledge_base_ids),
+                    KnowledgeBaseDocument.status == READY_STATUS,
                 )
-                .where(KnowledgeBase.id.in_(knowledge_base_ids))
-                .group_by(KnowledgeBase.id)
             ).all()
 
-        knowledge_base_map = {
-            knowledge_base.id: (knowledge_base, ready_document_count)
-            for knowledge_base, ready_document_count in rows
-        }
+        knowledge_base_map = {item.id: item for item in items}
+        ready_document_id_map: dict[str, list[str]] = {}
+        for knowledge_base_id, document_id in ready_document_rows:
+            ready_document_id_map.setdefault(knowledge_base_id, []).append(document_id)
         retrieved_chunks: list[dict[str, Any]] = []
         used_chars = 0
+        retrieval_log_items: list[dict[str, Any]] = []
+        started_at = time.perf_counter()
 
         for knowledge_base_ref in knowledge_bases:
-            knowledge_base_item = knowledge_base_map.get(knowledge_base_ref.id)
-            if knowledge_base_item is None:
+            knowledge_base = knowledge_base_map.get(knowledge_base_ref.id)
+            if knowledge_base is None:
+                retrieval_log_items.append(
+                    self._build_retrieval_log_item(
+                        knowledge_base_ref,
+                        status="missing",
+                    )
+                )
                 continue
 
-            knowledge_base, ready_document_count = knowledge_base_item
+            ready_document_ids = ready_document_id_map.get(knowledge_base.id, [])
             # document_count 是冗余汇总字段，检索前以文档表实时状态为准。
-            if ready_document_count <= 0:
+            if not ready_document_ids:
+                retrieval_log_items.append(
+                    self._build_retrieval_log_item(
+                        knowledge_base_ref,
+                        status="skipped_no_ready_documents",
+                    )
+                )
                 continue
 
             try:
+                knowledge_base_config = dict(knowledge_base.config or {})
+                effective_score_threshold = self._normalize_score_threshold(
+                    knowledge_base_config.get("retrieval_score_threshold"),
+                    score_threshold,
+                )
                 query_vector = self._embed_query(
-                    dict(knowledge_base.config or {}), normalized_question
+                    knowledge_base_config, normalized_question
                 )
                 hits = self._query_knowledge_base_chunks(
-                    knowledge_base.id, query_vector, top_k
+                    knowledge_base.id,
+                    query_vector,
+                    top_k,
+                    effective_score_threshold,
+                    ready_document_ids,
                 )
             except Exception:
                 # 检索增强是可选上下文，单个知识库失败时保留普通聊天能力。
+                retrieval_log_items.append(
+                    self._build_retrieval_log_item(
+                        knowledge_base_ref,
+                        status="failed",
+                    )
+                )
                 continue
+
+            retrieval_log_items.append(
+                self._build_retrieval_log_item(
+                    knowledge_base_ref,
+                    status="searched",
+                    score_threshold=effective_score_threshold,
+                    hits=hits,
+                )
+            )
 
             for hit in hits:
                 payload = hit.payload or {}
@@ -316,6 +361,9 @@ class KnowledgeBaseService:
 
                 remaining_chars = context_char_limit - used_chars
                 if remaining_chars <= 0:
+                    self._log_retrieval_result(
+                        normalized_question, retrieval_log_items, started_at, retrieved_chunks
+                    )
                     return retrieved_chunks
 
                 truncated_text = text[:remaining_chars]
@@ -333,8 +381,14 @@ class KnowledgeBaseService:
                 )
 
                 if used_chars >= context_char_limit:
+                    self._log_retrieval_result(
+                        normalized_question, retrieval_log_items, started_at, retrieved_chunks
+                    )
                     return retrieved_chunks
 
+        self._log_retrieval_result(
+            normalized_question, retrieval_log_items, started_at, retrieved_chunks
+        )
         return retrieved_chunks
 
     def upload_knowledge_base_document(
@@ -667,21 +721,94 @@ class KnowledgeBaseService:
             return False
 
     def _query_knowledge_base_chunks(
-        self, knowledge_base_id: str, query_vector: list[float], top_k: int
+        self,
+        knowledge_base_id: str,
+        query_vector: list[float],
+        top_k: int,
+        score_threshold: float | None,
+        ready_document_ids: list[str],
     ) -> list[Any]:
         collection_name = self._collection_name(knowledge_base_id)
         if not self._collection_exists(collection_name):
             return []
 
         # 本项目锁定的 qdrant-client 使用 query_points 作为向量检索入口。
+        _, qdrant_models = self._import_qdrant()
+        query_filter = qdrant_models.Filter(
+            must=[
+                qdrant_models.FieldCondition(
+                    key="document_id",
+                    match=qdrant_models.MatchAny(any=ready_document_ids),
+                )
+            ]
+        )
         response = self._get_qdrant_client().query_points(
             collection_name=collection_name,
             query=query_vector,
+            query_filter=query_filter,
             limit=top_k,
             with_payload=True,
             with_vectors=False,
+            score_threshold=score_threshold,
         )
         return list(response.points or [])
+
+    def _normalize_score_threshold(
+        self, value: Any, default_score_threshold: float | None
+    ) -> float | None:
+        if value is None or value == "":
+            return default_score_threshold
+        try:
+            score_threshold = float(value)
+        except (TypeError, ValueError):
+            return default_score_threshold
+        if score_threshold <= 0:
+            return None
+        return min(score_threshold, 1.0)
+
+    def _build_retrieval_log_item(
+        self,
+        knowledge_base: KnowledgeBaseReference,
+        *,
+        status: str,
+        score_threshold: float | None = None,
+        hits: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "knowledge_base_id": knowledge_base.id,
+            "knowledge_base_name": knowledge_base.name,
+            "status": status,
+            "score_threshold": score_threshold,
+            "hit_count": len(hits or []),
+            "hits": [
+                {
+                    "score": getattr(hit, "score", None),
+                    "document_id": (hit.payload or {}).get("document_id"),
+                    "original_filename": (hit.payload or {}).get("original_filename"),
+                    "chunk_index": (hit.payload or {}).get("chunk_index"),
+                }
+                for hit in hits or []
+            ],
+        }
+
+    def _log_retrieval_result(
+        self,
+        question: str,
+        retrieval_log_items: list[dict[str, Any]],
+        started_at: float,
+        retrieved_chunks: list[dict[str, Any]],
+    ) -> None:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        log_payload = {
+            "question": question,
+            "elapsed_ms": elapsed_ms,
+            "retrieved_chunk_count": len(retrieved_chunks),
+            "knowledge_bases": retrieval_log_items,
+        }
+        logger.info(
+            "知识库检索结果:\n%s",
+            json.dumps(log_payload, ensure_ascii=False, indent=2),
+        )
 
     def _upsert_document_chunks(
         self,

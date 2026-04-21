@@ -600,6 +600,13 @@ function formatFileSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function formatRetrievalScore(score) {
+  if (score === null || score === undefined) {
+    return "score -";
+  }
+  return `score ${Number(score).toFixed(3)}`;
+}
+
 onMounted(async () => {
   await switchView(currentView.value);
 });
@@ -758,6 +765,28 @@ onMounted(async () => {
                   <time>{{ formatTime(message.created_at) }}</time>
                 </div>
                 <p>{{ message.content }}</p>
+                <div
+                  v-if="message.retrieved_chunks?.length"
+                  class="message-retrieval"
+                >
+                  <div class="message-retrieval-title">本次命中的知识库片段</div>
+                  <div class="message-retrieval-list">
+                    <section
+                      v-for="(chunk, index) in message.retrieved_chunks"
+                      :key="`${chunk.document_id}-${chunk.chunk_index}-${index}`"
+                      class="message-retrieval-item"
+                    >
+                      <div class="message-retrieval-source">
+                        <strong>[来源 {{ index + 1 }}] {{ chunk.original_filename || "未知文档" }}</strong>
+                        <span>{{ formatRetrievalScore(chunk.score) }}</span>
+                      </div>
+                      <div class="message-retrieval-meta">
+                        {{ chunk.knowledge_base_name }} · chunk {{ chunk.chunk_index }}
+                      </div>
+                      <p>{{ chunk.text }}</p>
+                    </section>
+                  </div>
+                </div>
               </article>
             </div>
 
