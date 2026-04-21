@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
   session_id CHAR(32) NOT NULL,
   role VARCHAR(20) NOT NULL,
   content TEXT NOT NULL,
+  retrieved_chunks JSON NULL,
   created_at DATETIME(6) NOT NULL,
   PRIMARY KEY (id),
   KEY ix_chat_messages_session_created (session_id, created_at, id),

@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.dialects.mysql import DATETIME
@@ -35,6 +36,10 @@ class ChatMessage(Base):
     )
     role: Mapped[str] = mapped_column(String(20), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # 保存本次回答命中的知识库片段快照，刷新页面后仍可展示“来源”。
+    retrieved_chunks: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSON, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
 
 

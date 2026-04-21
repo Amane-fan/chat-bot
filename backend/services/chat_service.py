@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI
-from sqlalchemy import delete, func, inspect, select
+from sqlalchemy import delete, func, inspect, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -72,6 +72,7 @@ class ChatService:
                 raise RuntimeError(
                     "MySQL 中缺少聊天相关表，请先执行 backend/sql/mysql_schema.sql"
                 )
+            self._ensure_chat_message_columns(inspector)
         except SQLAlchemyError as exc:
             raise RuntimeError("无法连接 MySQL，请检查 MYSQL_* 配置") from exc
 
@@ -226,6 +227,7 @@ class ChatService:
         except Exception as exc:
             raise HTTPException(status_code=502, detail="模型调用失败") from exc
         answer = self._append_reference_section(answer, retrieved_chunks)
+        retrieved_chunk_payload = self._serialize_retrieved_chunks(retrieved_chunks)
 
         user_message_created_at = utc_now()
         assistant_message_created_at = utc_now()
@@ -246,6 +248,7 @@ class ChatService:
                 session_id=session_id,
                 role="assistant",
                 content=answer,
+                retrieved_chunks=retrieved_chunk_payload,
                 created_at=assistant_message_created_at,
             )
             session.add_all([user_message_model, assistant_message_model])
@@ -260,9 +263,7 @@ class ChatService:
         return ChatExchangeResponse(
             session=summary,
             user_message=self._message_record_from_model(user_message_model),
-            assistant_message=self._message_record_from_model(
-                assistant_message_model, retrieved_chunks
-            ),
+            assistant_message=self._message_record_from_model(assistant_message_model),
         )
 
     def stream_message(self, session_id: str, content: str):
@@ -342,6 +343,9 @@ class ChatService:
                 session_id=session_id,
                 role="assistant",
                 content=answer,
+                retrieved_chunks=[
+                    chunk.model_dump() for chunk in retrieved_chunk_records
+                ],
                 created_at=assistant_message_created_at,
             )
             session.add_all([user_message_model, assistant_message_model])
@@ -356,9 +360,7 @@ class ChatService:
         exchange = ChatExchangeResponse(
             session=summary,
             user_message=self._message_record_from_model(user_message_model),
-            assistant_message=self._message_record_from_model(
-                assistant_message_model, retrieved_chunks
-            ),
+            assistant_message=self._message_record_from_model(assistant_message_model),
         )
         yield self._stream_event("done", {"exchange": exchange.model_dump()})
 
@@ -385,6 +387,20 @@ class ChatService:
         if self.chain is None:
             raise RuntimeError("模型链尚未初始化")
         return self.chain
+
+    def _ensure_chat_message_columns(self, inspector) -> None:
+        column_names = {
+            column["name"] for column in inspector.get_columns("chat_messages")
+        }
+        if "retrieved_chunks" in column_names:
+            return
+
+        # 兼容已有 MySQL 数据库：老表缺少来源片段列时启动阶段自动补齐。
+        engine = get_engine()
+        with engine.begin() as connection:
+            connection.execute(
+                text("ALTER TABLE chat_messages ADD COLUMN retrieved_chunks JSON NULL")
+            )
 
     def _stream_event(self, event_type: str, payload: dict[str, Any]) -> str:
         return json.dumps(
@@ -478,6 +494,15 @@ class ChatService:
             )
         return records
 
+    def _serialize_retrieved_chunks(
+        self, retrieved_chunks: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        # JSON 字段只保存响应模型需要的字段，形成当次回答的来源快照。
+        return [
+            chunk.model_dump()
+            for chunk in self._to_retrieved_chunk_records(retrieved_chunks)
+        ]
+
     def _build_session_title(self, content: str) -> str:
         normalized = " ".join(content.split())
         if not normalized:
@@ -510,11 +535,17 @@ class ChatService:
         message: ChatMessage,
         retrieved_chunks: list[dict[str, Any]] | None = None,
     ) -> MessageRecord:
+        stored_retrieved_chunks = retrieved_chunks
+        if stored_retrieved_chunks is None and message.role == "assistant":
+            stored_retrieved_chunks = message.retrieved_chunks or []
+
         return MessageRecord(
             role=message.role,
             content=message.content,
             created_at=to_iso_string(message.created_at),
-            retrieved_chunks=self._to_retrieved_chunk_records(retrieved_chunks or []),
+            retrieved_chunks=self._to_retrieved_chunk_records(
+                stored_retrieved_chunks or []
+            ),
         )
 
     def _load_messages(self, session: Session, session_id: str) -> list[MessageRecord]:
