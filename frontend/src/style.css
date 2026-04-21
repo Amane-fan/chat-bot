@@ -681,6 +681,15 @@ button {
 .knowledge-document-header strong {
   font-size: 0.95rem;
   line-height: 1.4;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.knowledge-document-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
 }
 
 .knowledge-document-meta {

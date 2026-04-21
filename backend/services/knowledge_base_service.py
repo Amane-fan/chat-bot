@@ -14,6 +14,7 @@ from backend.db import get_engine, get_session_factory, init_mysql
 from backend.models import KnowledgeBase, KnowledgeBaseDocument
 from backend.schemas import (
     KnowledgeBaseCreateRequest,
+    KnowledgeBaseDocumentDeleteResponse,
     KnowledgeBaseDocumentListResponse,
     KnowledgeBaseDocumentSummary,
     KnowledgeBaseDocumentUploadResponse,
@@ -265,17 +266,35 @@ class KnowledgeBaseService:
         session_factory = get_session_factory()
         knowledge_base_ids = [item.id for item in knowledge_bases]
         with session_factory() as session:
-            items = session.scalars(
-                select(KnowledgeBase).where(KnowledgeBase.id.in_(knowledge_base_ids))
+            rows = session.execute(
+                select(
+                    KnowledgeBase,
+                    func.count(KnowledgeBaseDocument.id).label("ready_document_count"),
+                )
+                .outerjoin(
+                    KnowledgeBaseDocument,
+                    (KnowledgeBaseDocument.knowledge_base_id == KnowledgeBase.id)
+                    & (KnowledgeBaseDocument.status == READY_STATUS),
+                )
+                .where(KnowledgeBase.id.in_(knowledge_base_ids))
+                .group_by(KnowledgeBase.id)
             ).all()
 
-        knowledge_base_map = {item.id: item for item in items}
+        knowledge_base_map = {
+            knowledge_base.id: (knowledge_base, ready_document_count)
+            for knowledge_base, ready_document_count in rows
+        }
         retrieved_chunks: list[dict[str, Any]] = []
         used_chars = 0
 
         for knowledge_base_ref in knowledge_bases:
-            knowledge_base = knowledge_base_map.get(knowledge_base_ref.id)
-            if knowledge_base is None or knowledge_base.document_count <= 0:
+            knowledge_base_item = knowledge_base_map.get(knowledge_base_ref.id)
+            if knowledge_base_item is None:
+                continue
+
+            knowledge_base, ready_document_count = knowledge_base_item
+            # document_count 是冗余汇总字段，检索前以文档表实时状态为准。
+            if ready_document_count <= 0:
                 continue
 
             try:
@@ -415,12 +434,53 @@ class KnowledgeBaseService:
             document.chunk_count = len(vectors)
             document.error_message = None
             document.updated_at = utc_now()
+            # 先 flush 文档状态，否则 autoflush=False 时下面的 count 看不到 ready 状态。
+            session.flush()
             knowledge_base.document_count = self._count_ready_documents(session, knowledge_base_id)
             knowledge_base.updated_at = utc_now()
             session.commit()
 
             return KnowledgeBaseDocumentUploadResponse(
                 document=self._to_document_summary(document),
+                knowledge_base=self._to_summary(knowledge_base),
+            )
+
+    def delete_knowledge_base_document(
+        self, knowledge_base_id: str, document_id: str
+    ) -> KnowledgeBaseDocumentDeleteResponse:
+        """删除知识库文档，并同步清理向量和本地文件。"""
+
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            knowledge_base = self._get_knowledge_base_or_404(session, knowledge_base_id)
+            document = self._get_knowledge_base_document_or_404(
+                session, knowledge_base_id, document_id
+            )
+            document_summary = self._to_document_summary(document)
+            document_snapshot = self._document_snapshot(document)
+
+        try:
+            # 先清理检索侧资源，避免 MySQL 删除成功后 Qdrant 中残留可检索片段。
+            self._delete_document_artifacts(document_snapshot)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail="删除文档资源失败") from exc
+
+        with session_factory() as session:
+            knowledge_base = self._get_knowledge_base_or_404(session, knowledge_base_id)
+            document = self._get_knowledge_base_document_or_404(
+                session, knowledge_base_id, document_id
+            )
+            session.delete(document)
+            # 删除记录后再统计 ready 文档数，保证列表中的 document_count 同步变化。
+            session.flush()
+            knowledge_base.document_count = self._count_ready_documents(
+                session, knowledge_base_id
+            )
+            knowledge_base.updated_at = utc_now()
+            session.commit()
+
+            return KnowledgeBaseDocumentDeleteResponse(
+                document=document_summary,
                 knowledge_base=self._to_summary(knowledge_base),
             )
 
@@ -707,9 +767,28 @@ class KnowledgeBaseService:
             document.status = FAILED_STATUS
             document.error_message = self._truncate_error_message(error_message)
             document.updated_at = utc_now()
+            # 失败状态也要先落到当前事务，再重新统计 ready 文档数。
+            session.flush()
             knowledge_base.document_count = self._count_ready_documents(session, knowledge_base_id)
             knowledge_base.updated_at = utc_now()
             session.commit()
+
+    def rebuild_document_counts(self) -> int:
+        """按文档表状态回填知识库 document_count，返回被修正的知识库数量。"""
+
+        session_factory = get_session_factory()
+        updated_count = 0
+        with session_factory() as session:
+            knowledge_bases = session.scalars(select(KnowledgeBase)).all()
+            for knowledge_base in knowledge_bases:
+                ready_document_count = self._count_ready_documents(session, knowledge_base.id)
+                if knowledge_base.document_count == ready_document_count:
+                    continue
+                knowledge_base.document_count = ready_document_count
+                knowledge_base.updated_at = utc_now()
+                updated_count += 1
+            session.commit()
+        return updated_count
 
     def _truncate_error_message(self, error_message: str) -> str:
         normalized = " ".join((error_message or "未知错误").split())
@@ -747,6 +826,14 @@ class KnowledgeBaseService:
     def _get_document_or_404(self, session, document_id: str) -> KnowledgeBaseDocument:
         document = session.get(KnowledgeBaseDocument, document_id)
         if document is None:
+            raise HTTPException(status_code=404, detail="文档不存在")
+        return document
+
+    def _get_knowledge_base_document_or_404(
+        self, session, knowledge_base_id: str, document_id: str
+    ) -> KnowledgeBaseDocument:
+        document = self._get_document_or_404(session, document_id)
+        if document.knowledge_base_id != knowledge_base_id:
             raise HTTPException(status_code=404, detail="文档不存在")
         return document
 

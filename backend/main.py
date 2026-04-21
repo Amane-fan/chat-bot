@@ -6,6 +6,7 @@ from backend.schemas import (
     ChatExchangeResponse,
     ChatRequest,
     KnowledgeBaseCreateRequest,
+    KnowledgeBaseDocumentDeleteResponse,
     KnowledgeBaseDocumentListResponse,
     KnowledgeBaseDocumentUploadResponse,
     KnowledgeBaseListResponse,
@@ -157,3 +158,18 @@ def upload_knowledge_base_document(
     """上传一个知识库文档并同步完成切分、向量化和入库。"""
 
     return knowledge_base_service.upload_knowledge_base_document(knowledge_base_id, file)
+
+
+@app.delete(
+    "/api/knowledge-bases/{knowledge_base_id}/documents/{document_id}",
+    response_model=KnowledgeBaseDocumentDeleteResponse,
+)
+def delete_knowledge_base_document(
+    knowledge_base_id: str,
+    document_id: str,
+) -> KnowledgeBaseDocumentDeleteResponse:
+    """删除指定知识库文档，并同步清理本地文件和向量数据。"""
+
+    return knowledge_base_service.delete_knowledge_base_document(
+        knowledge_base_id, document_id
+    )

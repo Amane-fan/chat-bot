@@ -166,6 +166,7 @@ npm run dev
 - `GET /api/knowledge-bases?page=1&page_size=10`
 - `GET /api/knowledge-bases/{knowledge_base_id}/documents`
 - `POST /api/knowledge-bases/{knowledge_base_id}/documents`
+- `DELETE /api/knowledge-bases/{knowledge_base_id}/documents/{document_id}`
 
 创建知识库请求示例：
 

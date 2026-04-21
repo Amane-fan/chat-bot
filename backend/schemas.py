@@ -142,3 +142,10 @@ class KnowledgeBaseDocumentUploadResponse(BaseModel):
 
     document: KnowledgeBaseDocumentSummary
     knowledge_base: KnowledgeBaseSummary
+
+
+class KnowledgeBaseDocumentDeleteResponse(BaseModel):
+    """删除文档后的聚合返回。"""
+
+    document: KnowledgeBaseDocumentSummary
+    knowledge_base: KnowledgeBaseSummary

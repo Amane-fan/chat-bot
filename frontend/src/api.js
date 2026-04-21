@@ -98,3 +98,9 @@ export function uploadKnowledgeBaseDocument(knowledgeBaseId, file) {
     body: formData,
   });
 }
+
+export function deleteKnowledgeBaseDocument(knowledgeBaseId, documentId) {
+  return request(`/knowledge-bases/${knowledgeBaseId}/documents/${documentId}`, {
+    method: "DELETE",
+  });
+}

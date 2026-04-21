@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from "vue";
 import {
   createKnowledgeBase,
   createSession,
+  deleteKnowledgeBaseDocument,
   deleteSession,
   getKnowledgeBaseDocuments,
   getKnowledgeBaseOptions,
@@ -59,6 +60,7 @@ const knowledgeBaseForm = ref({
 const knowledgeBaseDocuments = ref({});
 const loadingKnowledgeBaseDocumentIds = ref({});
 const uploadingKnowledgeBaseDocumentIds = ref({});
+const deletingKnowledgeBaseDocumentIds = ref({});
 const pendingKnowledgeBaseFiles = ref({});
 const knowledgeBaseUploadInputKeys = ref({});
 
@@ -459,6 +461,37 @@ async function handleUploadKnowledgeBaseDocument(knowledgeBaseId) {
     uploadingKnowledgeBaseDocumentIds.value = {
       ...uploadingKnowledgeBaseDocumentIds.value,
       [knowledgeBaseId]: false,
+    };
+  }
+}
+
+async function handleDeleteKnowledgeBaseDocument(knowledgeBaseId, document) {
+  if (deletingKnowledgeBaseDocumentIds.value[document.id]) {
+    return;
+  }
+  const confirmed = window.confirm(`确认删除文档「${document.original_filename}」吗？`);
+  if (!confirmed) {
+    return;
+  }
+
+  deletingKnowledgeBaseDocumentIds.value = {
+    ...deletingKnowledgeBaseDocumentIds.value,
+    [document.id]: true,
+  };
+  errorMessage.value = "";
+
+  try {
+    await deleteKnowledgeBaseDocument(knowledgeBaseId, document.id);
+    await Promise.all([
+      loadKnowledgeBaseDocumentsForItem(knowledgeBaseId),
+      loadKnowledgeBases(knowledgeBasePage.value),
+    ]);
+  } catch (error) {
+    errorMessage.value = error.message;
+  } finally {
+    deletingKnowledgeBaseDocumentIds.value = {
+      ...deletingKnowledgeBaseDocumentIds.value,
+      [document.id]: false,
     };
   }
 }
@@ -911,12 +944,25 @@ onMounted(async () => {
                     >
                       <div class="knowledge-document-header">
                         <strong>{{ document.original_filename }}</strong>
-                        <span
-                          class="document-status"
-                          :class="`status-${document.status}`"
-                        >
-                          {{ formatDocumentStatus(document.status) }}
-                        </span>
+                        <div class="knowledge-document-actions">
+                          <span
+                            class="document-status"
+                            :class="`status-${document.status}`"
+                          >
+                            {{ formatDocumentStatus(document.status) }}
+                          </span>
+                          <button
+                            class="ghost-button danger"
+                            :disabled="deletingKnowledgeBaseDocumentIds[document.id]"
+                            @click="handleDeleteKnowledgeBaseDocument(item.id, document)"
+                          >
+                            {{
+                              deletingKnowledgeBaseDocumentIds[document.id]
+                                ? "删除中..."
+                                : "删除"
+                            }}
+                          </button>
+                        </div>
                       </div>
                       <div class="knowledge-document-meta">
                         <span>{{ formatFileSize(document.file_size) }}</span>
