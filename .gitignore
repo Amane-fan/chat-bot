@@ -4,6 +4,13 @@
 !.env.example
 !frontend/.env.example
 
+# Local runtime data
+backend/storage/
+qdrant_storage/
+*.sqlite
+*.sqlite3
+*.db
+
 # Python virtual environments
 .venv/
 venv/
@@ -13,6 +20,7 @@ venv/
 __pycache__/
 *.py[cod]
 *.so
+.hypothesis/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -27,6 +35,7 @@ dist/
 node_modules/
 frontend/dist/
 frontend/.vite/
+frontend/coverage/
 
 # Logs
 *.log
