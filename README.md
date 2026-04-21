@@ -1,11 +1,12 @@
 # LangChain Chatbot
 
-一个基于 FastAPI、Vue、MySQL 和 LangChain 的聊天机器人示例项目。
+一个基于 FastAPI、Vue、MySQL、Qdrant 和 LangChain 的聊天机器人示例项目。
 
-当前项目包含两类核心数据：
+当前项目包含三类核心数据：
 
 - 聊天会话和消息历史使用 MySQL
-- 知识库元数据使用 MySQL
+- 知识库元数据和文档状态使用 MySQL
+- 文档切分后的向量块使用 Qdrant
 - LLM 通过 `langchain_openai.ChatOpenAI` 接入阿里百炼兼容接口
 
 ## 功能概览
@@ -14,6 +15,8 @@
 - 会话创建、重命名、删除
 - MySQL 持久化聊天记录
 - 知识库创建
+- 知识库文档上传
+- 按知识库配置进行文档切分与向量化
 - 知识库分页列表
 - 前端统一管理会话与知识库
 
@@ -50,6 +53,7 @@
 - Python 3.10+
 - Node.js 18+
 - MySQL 8.0+
+- Qdrant 1.8+
 
 ## 环境变量
 
@@ -59,12 +63,19 @@
 DASHSCOPE_API_KEY=your_dashscope_api_key
 DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 DASHSCOPE_DEFAULT_MODEL=qwen-plus
+EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 
 MYSQL_HOST=127.0.0.1
 MYSQL_PORT=3306
 MYSQL_USER=root
 MYSQL_PASSWORD=your_mysql_password
 MYSQL_DATABASE=langchain_chatbot
+
+QDRANT_URL=http://127.0.0.1:6333
+QDRANT_API_KEY=
+QDRANT_COLLECTION_PREFIX=kb
+DOCUMENT_STORAGE_ROOT=backend/storage/knowledge_bases
+MAX_DOCUMENT_SIZE_BYTES=20971520
 
 API_HOST=0.0.0.0
 API_PORT=8000
@@ -153,6 +164,8 @@ npm run dev
 
 - `POST /api/knowledge-bases`
 - `GET /api/knowledge-bases?page=1&page_size=10`
+- `GET /api/knowledge-bases/{knowledge_base_id}/documents`
+- `POST /api/knowledge-bases/{knowledge_base_id}/documents`
 
 创建知识库请求示例：
 
@@ -195,16 +208,17 @@ npm run dev
 }
 ```
 
+文档上传接口使用 `multipart/form-data`，字段名固定为 `file`。当前支持 `TXT / MD / PDF`，会按知识库配置中的 `embedding_model`、`chunk_size`、`chunk_overlap` 和 `separator` 同步完成切分和向量化。
+
 ## 存储说明
 
 - MySQL 保存聊天会话元数据和消息历史
-- MySQL 同时保存知识库元数据
-- 文档上传、切分、向量化和检索尚未接入，先通过 `config` 和 `document_count` 预留结构
+- MySQL 同时保存知识库元数据和文档处理状态
+- 原始文档文件落盘到 `DOCUMENT_STORAGE_ROOT`
+- Qdrant 保存文档切分后的向量块，collection 名称格式为 `{QDRANT_COLLECTION_PREFIX}_{knowledge_base_id}`
 
 ## 后续扩展方向
 
-- 知识库文档上传
-- 文本切分与向量化
 - 检索增强问答
 - 用户体系与权限隔离
 - Docker 部署

@@ -4,11 +4,15 @@ import {
   createKnowledgeBase,
   createSession,
   deleteSession,
+  getKnowledgeBaseDocuments,
+  getKnowledgeBaseOptions,
   getKnowledgeBases,
   getMessages,
   getSessions,
   renameSession,
   sendMessage,
+  updateSessionKnowledgeBases,
+  uploadKnowledgeBaseDocument,
 } from "./api";
 
 const sessions = ref([]);
@@ -25,6 +29,18 @@ const currentView = ref(getInitialView());
 const chatInitialized = ref(false);
 const knowledgeInitialized = ref(false);
 const sessionListCollapsed = ref(false);
+const sessionModalVisible = ref(false);
+const sessionModalMode = ref("create");
+const savingSessionConfig = ref(false);
+const pendingSendAfterSessionCreate = ref(false);
+const knowledgeOptionsLoading = ref(false);
+const knowledgeOptionsLoaded = ref(false);
+const knowledgeBaseOptions = ref([]);
+const sessionForm = ref({
+  sessionId: "",
+  title: "",
+  selectedKnowledgeBaseIds: [],
+});
 
 const knowledgeBases = ref([]);
 const knowledgeBasePage = ref(1);
@@ -40,12 +56,28 @@ const knowledgeBaseForm = ref({
   chunk_overlap: 50,
   separator: "\\n\\n",
 });
+const knowledgeBaseDocuments = ref({});
+const loadingKnowledgeBaseDocumentIds = ref({});
+const uploadingKnowledgeBaseDocumentIds = ref({});
+const pendingKnowledgeBaseFiles = ref({});
+const knowledgeBaseUploadInputKeys = ref({});
 
 const activeSession = computed(
   () => sessions.value.find((session) => session.id === activeSessionId.value) || null,
 );
 const knowledgeBaseTotalPages = computed(() =>
   Math.max(1, Math.ceil(knowledgeBaseTotal.value / knowledgeBasePageSize.value)),
+);
+const sessionModalHeading = computed(() =>
+  sessionModalMode.value === "create" ? "新建会话" : "编辑会话知识库",
+);
+const sessionModalSubmitLabel = computed(() =>
+  sessionModalMode.value === "create" ? "创建会话" : "保存知识库范围",
+);
+const sessionModalCopy = computed(() =>
+  sessionModalMode.value === "create"
+    ? "为新会话选择一个可选标题，并决定是否立刻绑定知识库。"
+    : "调整当前会话绑定的知识库范围。当前阶段只保存关系，不会改变回答逻辑。",
 );
 
 function getInitialView() {
@@ -81,6 +113,8 @@ async function loadSessions(preferredSessionId = "") {
       !data.some((session) => session.id === activeSessionId.value)
     ) {
       activeSessionId.value = data[0]?.id || "";
+    } else if (!data.length) {
+      activeSessionId.value = "";
     }
   } catch (error) {
     errorMessage.value = error.message;
@@ -106,6 +140,59 @@ async function loadMessagesForSession(sessionId) {
   }
 }
 
+async function loadKnowledgeBaseOptions(force = false) {
+  if (knowledgeOptionsLoaded.value && !force) {
+    return knowledgeBaseOptions.value;
+  }
+
+  knowledgeOptionsLoading.value = true;
+  errorMessage.value = "";
+  try {
+    knowledgeBaseOptions.value = await getKnowledgeBaseOptions();
+    knowledgeOptionsLoaded.value = true;
+  } catch (error) {
+    errorMessage.value = error.message;
+  } finally {
+    knowledgeOptionsLoading.value = false;
+  }
+
+  return knowledgeBaseOptions.value;
+}
+
+async function loadKnowledgeBaseDocumentsForItem(knowledgeBaseId) {
+  loadingKnowledgeBaseDocumentIds.value = {
+    ...loadingKnowledgeBaseDocumentIds.value,
+    [knowledgeBaseId]: true,
+  };
+
+  try {
+    const data = await getKnowledgeBaseDocuments(knowledgeBaseId);
+    knowledgeBaseDocuments.value = {
+      ...knowledgeBaseDocuments.value,
+      [knowledgeBaseId]: data.items,
+    };
+  } finally {
+    loadingKnowledgeBaseDocumentIds.value = {
+      ...loadingKnowledgeBaseDocumentIds.value,
+      [knowledgeBaseId]: false,
+    };
+  }
+}
+
+async function loadDocumentsForVisibleKnowledgeBases(items) {
+  const visibleIds = new Set(items.map((item) => item.id));
+  const nextDocuments = { ...knowledgeBaseDocuments.value };
+
+  Object.keys(nextDocuments).forEach((knowledgeBaseId) => {
+    if (!visibleIds.has(knowledgeBaseId)) {
+      delete nextDocuments[knowledgeBaseId];
+    }
+  });
+
+  knowledgeBaseDocuments.value = nextDocuments;
+  await Promise.all(items.map((item) => loadKnowledgeBaseDocumentsForItem(item.id)));
+}
+
 async function loadKnowledgeBases(page = knowledgeBasePage.value) {
   loadingKnowledgeBases.value = true;
   errorMessage.value = "";
@@ -114,6 +201,7 @@ async function loadKnowledgeBases(page = knowledgeBasePage.value) {
     knowledgeBases.value = data.items;
     knowledgeBasePage.value = data.page;
     knowledgeBaseTotal.value = data.total;
+    await loadDocumentsForVisibleKnowledgeBases(data.items);
     knowledgeInitialized.value = true;
   } catch (error) {
     errorMessage.value = error.message;
@@ -122,29 +210,97 @@ async function loadKnowledgeBases(page = knowledgeBasePage.value) {
   }
 }
 
-async function ensureSession() {
-  if (activeSessionId.value) {
-    return activeSessionId.value;
-  }
+function upsertSessionSummary(session, moveToTop = true) {
+  const nextSessions = sessions.value.filter((item) => item.id !== session.id);
+  sessions.value = moveToTop ? [session, ...nextSessions] : [...nextSessions, session];
+}
 
-  const session = await createSession();
-  sessions.value = [session, ...sessions.value];
-  activeSessionId.value = session.id;
-  messages.value = [];
-  return session.id;
+async function openSessionModal(mode, session = null, { pendingSend = false } = {}) {
+  await loadKnowledgeBaseOptions();
+  sessionModalMode.value = mode;
+  pendingSendAfterSessionCreate.value = pendingSend;
+  sessionForm.value = {
+    sessionId: session?.id || "",
+    title: mode === "create" ? "" : session?.title || "",
+    selectedKnowledgeBaseIds: session?.knowledge_bases?.map((item) => item.id) || [],
+  };
+  sessionModalVisible.value = true;
+}
+
+function closeSessionModal() {
+  sessionModalVisible.value = false;
+  savingSessionConfig.value = false;
+  pendingSendAfterSessionCreate.value = false;
+  sessionForm.value = {
+    sessionId: "",
+    title: "",
+    selectedKnowledgeBaseIds: [],
+  };
+}
+
+function toggleKnowledgeBaseSelection(knowledgeBaseId) {
+  const selectedIds = new Set(sessionForm.value.selectedKnowledgeBaseIds);
+  if (selectedIds.has(knowledgeBaseId)) {
+    selectedIds.delete(knowledgeBaseId);
+  } else {
+    selectedIds.add(knowledgeBaseId);
+  }
+  sessionForm.value.selectedKnowledgeBaseIds = Array.from(selectedIds);
+}
+
+function clearSessionModalKnowledgeBases() {
+  sessionForm.value.selectedKnowledgeBaseIds = [];
 }
 
 async function handleCreateSession() {
   errorMessage.value = "";
+  await openSessionModal("create");
+}
+
+async function handleEditSessionKnowledgeBases(session) {
+  errorMessage.value = "";
+  await openSessionModal("edit", session);
+}
+
+async function submitSessionModal() {
+  if (savingSessionConfig.value) {
+    return;
+  }
+
+  savingSessionConfig.value = true;
+  errorMessage.value = "";
   try {
-    const session = await createSession();
-    sessions.value = [session, ...sessions.value];
-    activeSessionId.value = session.id;
-    messages.value = [];
-    draft.value = "";
-    chatInitialized.value = true;
+    if (sessionModalMode.value === "create") {
+      const title = sessionForm.value.title.trim();
+      const createdSession = await createSession({
+        title: title || undefined,
+        knowledgeBaseIds: sessionForm.value.selectedKnowledgeBaseIds,
+      });
+      upsertSessionSummary(createdSession);
+      activeSessionId.value = createdSession.id;
+      messages.value = [];
+      chatInitialized.value = true;
+
+      const shouldSendPendingMessage =
+        pendingSendAfterSessionCreate.value && draft.value.trim().length > 0;
+      closeSessionModal();
+
+      if (shouldSendPendingMessage) {
+        await performSendMessage(createdSession.id, draft.value.trim());
+      }
+      return;
+    }
+
+    const updatedSession = await updateSessionKnowledgeBases(
+      sessionForm.value.sessionId,
+      sessionForm.value.selectedKnowledgeBaseIds,
+    );
+    upsertSessionSummary(updatedSession);
+    activeSessionId.value = updatedSession.id;
+    closeSessionModal();
   } catch (error) {
     errorMessage.value = error.message;
+    savingSessionConfig.value = false;
   }
 }
 
@@ -188,14 +344,28 @@ async function submitRename(sessionId) {
   errorMessage.value = "";
   try {
     const updated = await renameSession(sessionId, title);
-    sessions.value = sessions.value.map((session) =>
-      session.id === sessionId ? updated : session,
-    );
+    upsertSessionSummary(updated);
   } catch (error) {
     errorMessage.value = error.message;
   } finally {
     editingSessionId.value = "";
     editingTitle.value = "";
+  }
+}
+
+async function performSendMessage(sessionId, content) {
+  sending.value = true;
+  errorMessage.value = "";
+  try {
+    const exchange = await sendMessage(sessionId, content);
+    draft.value = "";
+    messages.value = [...messages.value, exchange.user_message, exchange.assistant_message];
+    upsertSessionSummary(exchange.session);
+    activeSessionId.value = exchange.session.id;
+  } catch (error) {
+    errorMessage.value = error.message;
+  } finally {
+    sending.value = false;
   }
 }
 
@@ -205,23 +375,12 @@ async function handleSendMessage() {
     return;
   }
 
-  sending.value = true;
-  errorMessage.value = "";
-  try {
-    const sessionId = await ensureSession();
-    const exchange = await sendMessage(sessionId, content);
-    draft.value = "";
-    messages.value = [...messages.value, exchange.user_message, exchange.assistant_message];
-    sessions.value = [
-      exchange.session,
-      ...sessions.value.filter((session) => session.id !== exchange.session.id),
-    ];
-    activeSessionId.value = exchange.session.id;
-  } catch (error) {
-    errorMessage.value = error.message;
-  } finally {
-    sending.value = false;
+  if (!activeSessionId.value) {
+    await openSessionModal("create", null, { pendingSend: true });
+    return;
   }
+
+  await performSendMessage(activeSessionId.value, content);
 }
 
 async function handleCreateKnowledgeBase() {
@@ -251,11 +410,56 @@ async function handleCreateKnowledgeBase() {
       chunk_overlap: 50,
       separator: "\\n\\n",
     };
+    knowledgeOptionsLoaded.value = false;
     await loadKnowledgeBases(1);
   } catch (error) {
     errorMessage.value = error.message;
   } finally {
     creatingKnowledgeBase.value = false;
+  }
+}
+
+function handleKnowledgeBaseFileChange(knowledgeBaseId, event) {
+  pendingKnowledgeBaseFiles.value = {
+    ...pendingKnowledgeBaseFiles.value,
+    [knowledgeBaseId]: event.target.files?.[0] || null,
+  };
+}
+
+function resetKnowledgeBaseUploadInput(knowledgeBaseId) {
+  knowledgeBaseUploadInputKeys.value = {
+    ...knowledgeBaseUploadInputKeys.value,
+    [knowledgeBaseId]: (knowledgeBaseUploadInputKeys.value[knowledgeBaseId] || 0) + 1,
+  };
+  pendingKnowledgeBaseFiles.value = {
+    ...pendingKnowledgeBaseFiles.value,
+    [knowledgeBaseId]: null,
+  };
+}
+
+async function handleUploadKnowledgeBaseDocument(knowledgeBaseId) {
+  const file = pendingKnowledgeBaseFiles.value[knowledgeBaseId];
+  if (!file || uploadingKnowledgeBaseDocumentIds.value[knowledgeBaseId]) {
+    return;
+  }
+
+  uploadingKnowledgeBaseDocumentIds.value = {
+    ...uploadingKnowledgeBaseDocumentIds.value,
+    [knowledgeBaseId]: true,
+  };
+  errorMessage.value = "";
+
+  try {
+    await uploadKnowledgeBaseDocument(knowledgeBaseId, file);
+    resetKnowledgeBaseUploadInput(knowledgeBaseId);
+    await loadKnowledgeBases(knowledgeBasePage.value);
+  } catch (error) {
+    errorMessage.value = error.message;
+  } finally {
+    uploadingKnowledgeBaseDocumentIds.value = {
+      ...uploadingKnowledgeBaseDocumentIds.value,
+      [knowledgeBaseId]: false,
+    };
   }
 }
 
@@ -272,10 +476,11 @@ async function initializeChatView() {
   }
 
   await loadSessions();
-  if (!sessions.value.length) {
-    await handleCreateSession();
-  } else {
+  await loadKnowledgeBaseOptions();
+  if (activeSessionId.value) {
     await loadMessagesForSession(activeSessionId.value);
+  } else {
+    messages.value = [];
   }
   chatInitialized.value = true;
 }
@@ -325,6 +530,41 @@ function formatKnowledgeBaseConfig(config) {
     parts.push(`overlap ${config.chunk_overlap}`);
   }
   return parts.join(" · ") || "未设置配置";
+}
+
+function formatSessionKnowledgeBases(knowledgeBases, limit = 2) {
+  if (!knowledgeBases?.length) {
+    return "未绑定知识库";
+  }
+
+  const names = knowledgeBases.map((item) => item.name);
+  if (names.length <= limit) {
+    return names.join(" · ");
+  }
+  return `${names.slice(0, limit).join(" · ")} +${names.length - limit}`;
+}
+
+function formatDocumentStatus(status) {
+  if (status === "ready") {
+    return "已入库";
+  }
+  if (status === "failed") {
+    return "处理失败";
+  }
+  return "处理中";
+}
+
+function formatFileSize(bytes) {
+  if (!bytes) {
+    return "0 B";
+  }
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 onMounted(async () => {
@@ -386,7 +626,7 @@ onMounted(async () => {
             <p class="eyebrow chat-eyebrow">Conversation Atelier</p>
             <h2>{{ activeSession?.title || "聊天界面" }}</h2>
           </div>
-          <p class="hint">只保留会话和消息流，让当前对话像一张独立展墙。</p>
+          <p class="hint">会话先绑定知识库范围，当前阶段仅保存关系，为后续检索预留入口。</p>
         </header>
 
         <div class="chat-layout" :class="{ 'sessions-collapsed': sessionListCollapsed }">
@@ -435,12 +675,21 @@ onMounted(async () => {
                     </template>
                     <template v-else>
                       <strong>{{ session.title }}</strong>
-                      <span>{{ session.message_count }} 条消息</span>
+                      <div class="session-copy-meta">
+                        <span>{{ session.message_count }} 条消息</span>
+                        <span>{{ formatSessionKnowledgeBases(session.knowledge_bases) }}</span>
+                      </div>
                     </template>
                   </div>
                   <div class="session-actions">
                     <span>{{ formatTime(session.updated_at) }}</span>
                     <div class="mini-actions">
+                      <button
+                        class="ghost-button"
+                        @click.stop="handleEditSessionKnowledgeBases(session)"
+                      >
+                        知识库
+                      </button>
                       <button class="ghost-button" @click.stop="startRename(session)">重命名</button>
                       <button class="ghost-button danger" @click.stop="handleDeleteSession(session.id)">
                         删除
@@ -460,6 +709,9 @@ onMounted(async () => {
 
             <div class="message-wall">
               <div v-if="loadingMessages" class="placeholder">正在加载消息...</div>
+              <div v-else-if="!activeSession" class="placeholder">
+                还没有活动会话。点击“新建会话”，或直接输入消息后在弹层里完成创建。
+              </div>
               <div v-else-if="!messages.length" class="placeholder">
                 这是一个空白会话。发第一条消息后，标题会自动取自首句内容。
               </div>
@@ -486,7 +738,7 @@ onMounted(async () => {
                 @keydown.enter.exact.prevent="handleSendMessage"
               />
               <div class="composer-actions">
-                <span>FastAPI + Vue + Redis</span>
+                <span>FastAPI + Vue + MySQL</span>
                 <button
                   class="primary-button composer-button"
                   :disabled="sending"
@@ -509,7 +761,7 @@ onMounted(async () => {
             <p class="eyebrow chat-eyebrow">Knowledge Studio</p>
             <h2>知识库界面</h2>
           </div>
-          <p class="hint">把知识库创建、分页浏览和配置编辑单独留在一个更安静的空间里。</p>
+          <p class="hint">在这里创建知识库，并把文档按对应分块和 embedding 配置同步写入 Qdrant。</p>
         </header>
 
         <div class="knowledge-workspace">
@@ -596,7 +848,7 @@ onMounted(async () => {
 
             <div class="knowledge-list-scroll">
               <div v-if="!knowledgeBases.length && !loadingKnowledgeBases" class="knowledge-empty">
-                还没有知识库。先创建一个元数据入口，后续再接文档上传和检索。
+                还没有知识库。先创建一个知识库，然后把 TXT、MD、PDF 文档上传进来。
               </div>
 
               <article v-for="item in knowledgeBases" :key="item.id" class="knowledge-card">
@@ -608,6 +860,74 @@ onMounted(async () => {
                 <div class="knowledge-meta">
                   <span>{{ formatKnowledgeBaseConfig(item.config) }}</span>
                   <time>{{ formatTime(item.created_at) }}</time>
+                </div>
+
+                <div class="knowledge-document-panel">
+                  <div class="knowledge-document-toolbar">
+                    <input
+                      :key="knowledgeBaseUploadInputKeys[item.id] || 0"
+                      class="field-input knowledge-file-input"
+                      accept=".txt,.md,.pdf"
+                      type="file"
+                      @change="handleKnowledgeBaseFileChange(item.id, $event)"
+                    />
+                    <button
+                      class="secondary-button upload-button"
+                      :disabled="
+                        !pendingKnowledgeBaseFiles[item.id] ||
+                        uploadingKnowledgeBaseDocumentIds[item.id]
+                      "
+                      @click="handleUploadKnowledgeBaseDocument(item.id)"
+                    >
+                      {{
+                        uploadingKnowledgeBaseDocumentIds[item.id]
+                          ? "处理中..."
+                          : "上传文档"
+                      }}
+                    </button>
+                  </div>
+
+                  <div class="knowledge-upload-copy">
+                    支持 TXT / MD / PDF，上传后将按当前知识库配置同步切分并写入向量库。
+                  </div>
+
+                  <div
+                    v-if="loadingKnowledgeBaseDocumentIds[item.id]"
+                    class="knowledge-empty knowledge-document-empty"
+                  >
+                    正在加载文档列表...
+                  </div>
+                  <div
+                    v-else-if="!(knowledgeBaseDocuments[item.id] || []).length"
+                    class="knowledge-empty knowledge-document-empty"
+                  >
+                    还没有上传文档。
+                  </div>
+                  <div v-else class="knowledge-document-list">
+                    <article
+                      v-for="document in knowledgeBaseDocuments[item.id]"
+                      :key="document.id"
+                      class="knowledge-document-item"
+                    >
+                      <div class="knowledge-document-header">
+                        <strong>{{ document.original_filename }}</strong>
+                        <span
+                          class="document-status"
+                          :class="`status-${document.status}`"
+                        >
+                          {{ formatDocumentStatus(document.status) }}
+                        </span>
+                      </div>
+                      <div class="knowledge-document-meta">
+                        <span>{{ formatFileSize(document.file_size) }}</span>
+                        <span>{{ document.chunk_count }} chunks</span>
+                        <span>{{ formatTime(document.updated_at) }}</span>
+                      </div>
+                      <p v-if="document.error_message" class="knowledge-document-error">
+                        {{ document.error_message }}
+                      </p>
+                    </article>
+                  </div>
                 </div>
               </article>
             </div>
@@ -633,5 +953,100 @@ onMounted(async () => {
         </div>
       </section>
     </main>
+
+    <div
+      v-if="sessionModalVisible"
+      class="modal-scrim"
+      role="presentation"
+      @click.self="closeSessionModal"
+    >
+      <section class="session-modal" aria-modal="true" role="dialog">
+        <div class="session-modal-header">
+          <div>
+            <p class="eyebrow chat-eyebrow">Session Setup</p>
+            <h3>{{ sessionModalHeading }}</h3>
+          </div>
+          <button class="ghost-button" @click="closeSessionModal">关闭</button>
+        </div>
+
+        <p class="session-modal-copy">{{ sessionModalCopy }}</p>
+
+        <label v-if="sessionModalMode === 'create'" class="field-label">
+          <span>会话标题</span>
+          <input
+            v-model="sessionForm.title"
+            class="field-input"
+            maxlength="80"
+            placeholder="默认会使用“新对话”"
+          />
+        </label>
+
+        <div class="session-modal-section">
+          <div class="session-modal-section-header">
+            <strong>知识库范围</strong>
+            <span>{{ sessionForm.selectedKnowledgeBaseIds.length }} 个已选</span>
+          </div>
+
+          <div v-if="sessionForm.selectedKnowledgeBaseIds.length" class="session-modal-selected">
+            <span
+              v-for="item in knowledgeBaseOptions.filter((option) =>
+                sessionForm.selectedKnowledgeBaseIds.includes(option.id),
+              )"
+              :key="item.id"
+              class="knowledge-chip"
+            >
+              {{ item.name }}
+            </span>
+          </div>
+
+          <div v-if="knowledgeOptionsLoading" class="knowledge-option-empty">
+            正在加载知识库选项...
+          </div>
+          <div v-else-if="!knowledgeBaseOptions.length" class="knowledge-option-empty">
+            当前还没有可选知识库。你仍然可以先创建不绑定知识库的会话。
+          </div>
+          <div v-else class="knowledge-option-list">
+            <label
+              v-for="item in knowledgeBaseOptions"
+              :key="item.id"
+              class="knowledge-option-card"
+              :class="{
+                selected: sessionForm.selectedKnowledgeBaseIds.includes(item.id),
+              }"
+            >
+              <input
+                type="checkbox"
+                :checked="sessionForm.selectedKnowledgeBaseIds.includes(item.id)"
+                @change="toggleKnowledgeBaseSelection(item.id)"
+              />
+              <div class="knowledge-option-copy">
+                <strong>{{ item.name }}</strong>
+                <span>{{ item.id.slice(0, 8) }}</span>
+              </div>
+            </label>
+          </div>
+        </div>
+
+        <div class="session-modal-actions">
+          <button
+            class="ghost-button"
+            :disabled="savingSessionConfig || !sessionForm.selectedKnowledgeBaseIds.length"
+            @click="clearSessionModalKnowledgeBases"
+          >
+            清空选择
+          </button>
+          <button class="secondary-button session-modal-secondary" @click="closeSessionModal">
+            取消
+          </button>
+          <button
+            class="primary-button session-modal-submit"
+            :disabled="savingSessionConfig"
+            @click="submitSessionModal"
+          >
+            {{ savingSessionConfig ? "处理中..." : sessionModalSubmitLabel }}
+          </button>
+        </div>
+      </section>
+    </div>
   </div>
 </template>

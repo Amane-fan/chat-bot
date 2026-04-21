@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class MessageRecord(BaseModel):
@@ -11,6 +11,13 @@ class MessageRecord(BaseModel):
     created_at: str
 
 
+class KnowledgeBaseReference(BaseModel):
+    """会话或选择器里使用的轻量知识库信息。"""
+
+    id: str
+    name: str
+
+
 class SessionSummary(BaseModel):
     """前端会话列表需要的摘要信息。"""
 
@@ -19,18 +26,26 @@ class SessionSummary(BaseModel):
     created_at: str
     updated_at: str
     message_count: int
+    knowledge_bases: list[KnowledgeBaseReference]
 
 
 class SessionCreateRequest(BaseModel):
     """创建会话时允许传入一个可选标题。"""
 
     title: str | None = Field(default=None, max_length=80)
+    knowledge_base_ids: list[str] = Field(default_factory=list)
 
 
 class SessionRenameRequest(BaseModel):
     """重命名会话。"""
 
     title: str = Field(min_length=1, max_length=80)
+
+
+class SessionKnowledgeBaseUpdateRequest(BaseModel):
+    """完整替换一个会话绑定的知识库列表。"""
+
+    knowledge_base_ids: list[str] = Field(default_factory=list)
 
 
 class ChatRequest(BaseModel):
@@ -57,6 +72,16 @@ class KnowledgeBaseConfig(BaseModel):
     chunk_size: int | None = Field(default=None, ge=1, le=10000)
     chunk_overlap: int | None = Field(default=None, ge=0, le=5000)
     separator: str | None = Field(default=None, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_chunk_config(self) -> "KnowledgeBaseConfig":
+        if (
+            self.chunk_size is not None
+            and self.chunk_overlap is not None
+            and self.chunk_overlap >= self.chunk_size
+        ):
+            raise ValueError("chunk_overlap 必须小于 chunk_size")
+        return self
 
 
 class KnowledgeBaseCreateRequest(BaseModel):
@@ -87,3 +112,33 @@ class KnowledgeBaseListResponse(BaseModel):
     page: int
     page_size: int
     total: int
+
+
+class KnowledgeBaseDocumentSummary(BaseModel):
+    """知识库文档摘要信息。"""
+
+    id: str
+    knowledge_base_id: str
+    original_filename: str
+    stored_filename: str
+    content_type: str | None
+    file_size: int
+    status: Literal["processing", "ready", "failed"]
+    chunk_count: int
+    error_message: str | None
+    created_at: str
+    updated_at: str
+
+
+class KnowledgeBaseDocumentListResponse(BaseModel):
+    """某个知识库下的文档列表。"""
+
+    knowledge_base_id: str
+    items: list[KnowledgeBaseDocumentSummary]
+
+
+class KnowledgeBaseDocumentUploadResponse(BaseModel):
+    """上传文档后的聚合返回。"""
+
+    document: KnowledgeBaseDocumentSummary
+    knowledge_base: KnowledgeBaseSummary

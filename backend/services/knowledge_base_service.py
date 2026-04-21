@@ -1,33 +1,135 @@
+import re
 import uuid
-from datetime import datetime, timezone
+from io import BytesIO
+from pathlib import Path
+from typing import Any
 
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
+from langchain_openai import OpenAIEmbeddings
 from sqlalchemy import func, inspect, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from backend import config
 from backend.db import get_engine, get_session_factory, init_mysql
-from backend.models import KnowledgeBase
+from backend.models import KnowledgeBase, KnowledgeBaseDocument
 from backend.schemas import (
     KnowledgeBaseCreateRequest,
+    KnowledgeBaseDocumentListResponse,
+    KnowledgeBaseDocumentSummary,
+    KnowledgeBaseDocumentUploadResponse,
     KnowledgeBaseListResponse,
+    KnowledgeBaseReference,
     KnowledgeBaseSummary,
 )
 
+DEFAULT_EMBEDDING_MODEL = "text-embedding-v1"
+DEFAULT_CHUNK_SIZE = 500
+DEFAULT_CHUNK_OVERLAP = 50
+PROCESSING_STATUS = "processing"
+READY_STATUS = "ready"
+FAILED_STATUS = "failed"
+ALLOWED_DOCUMENT_EXTENSIONS = {".txt", ".md", ".pdf"}
+DEFAULT_SEPARATORS = ["\n\n", "\n", " ", ""]
 
-def utc_now() -> datetime:
+
+def utc_now():
+    from datetime import datetime, timezone
+
     # MySQL DATETIME 不带时区，这里统一转成 UTC 的 naive datetime 存储。
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def to_iso_string(value: datetime) -> str:
+def to_iso_string(value):
+    from datetime import timezone
+
     # 对外响应统一补回 UTC 时区，前端展示时就能按标准 ISO 处理。
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.isoformat()
 
 
+class RecursiveCharacterTextSplitter:
+    """最小实现版本，按给定分隔符序列递归切分文本。"""
+
+    def __init__(
+        self,
+        *,
+        chunk_size: int,
+        chunk_overlap: int,
+        separators: list[str],
+    ) -> None:
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.separators = separators
+
+    def split_text(self, text: str) -> list[str]:
+        chunks = self._split_recursive(text, self.separators)
+        return self._apply_overlap(chunks)
+
+    def _split_recursive(self, text: str, separators: list[str]) -> list[str]:
+        text = text.strip()
+        if not text:
+            return []
+        if len(text) <= self.chunk_size:
+            return [text]
+        if not separators:
+            return self._split_fixed(text)
+
+        separator = separators[0]
+        if separator:
+            pieces = [piece.strip() for piece in text.split(separator) if piece.strip()]
+            joiner = separator
+        else:
+            pieces = [character for character in text]
+            joiner = ""
+
+        if len(pieces) <= 1:
+            return self._split_recursive(text, separators[1:])
+
+        chunks: list[str] = []
+        current = ""
+        for piece in pieces:
+            candidate = piece if not current else f"{current}{joiner}{piece}"
+            if len(candidate) <= self.chunk_size:
+                current = candidate
+                continue
+            if current:
+                chunks.append(current)
+            if len(piece) <= self.chunk_size:
+                current = piece
+            else:
+                chunks.extend(self._split_recursive(piece, separators[1:]))
+                current = ""
+
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _split_fixed(self, text: str) -> list[str]:
+        step = max(1, self.chunk_size - self.chunk_overlap)
+        return [
+            text[index : index + self.chunk_size].strip()
+            for index in range(0, len(text), step)
+            if text[index : index + self.chunk_size].strip()
+        ]
+
+    def _apply_overlap(self, chunks: list[str]) -> list[str]:
+        if not chunks or self.chunk_overlap <= 0:
+            return chunks
+
+        overlapped = [chunks[0]]
+        for chunk in chunks[1:]:
+            prefix = overlapped[-1][-self.chunk_overlap :]
+            merged = f"{prefix}{chunk}".strip()
+            overlapped.append(merged[-self.chunk_size :])
+        return overlapped
+
+
 class KnowledgeBaseService:
+    def __init__(self) -> None:
+        self.qdrant_client: Any | None = None
+        self.storage_root = Path(config.DOCUMENT_STORAGE_ROOT).resolve()
+
     def startup(self) -> None:
         # 启动阶段提前暴露配置或建表问题，避免请求进来后才报错。
         self._validate_settings()
@@ -37,13 +139,29 @@ class KnowledgeBaseService:
             engine = get_engine()
             with engine.connect():
                 pass
-            # 本项目不做自动建表，明确要求先执行仓库里的 SQL 文件。
-            if not inspect(engine).has_table("knowledge_bases"):
+            inspector = inspect(engine)
+            missing_tables = [
+                table_name
+                for table_name in ("knowledge_bases", "knowledge_base_documents")
+                if not inspector.has_table(table_name)
+            ]
+            if missing_tables:
                 raise RuntimeError(
-                    "MySQL 中缺少 knowledge_bases 表，请先执行 backend/sql/mysql_schema.sql"
+                    "MySQL 中缺少知识库相关表，请先执行 backend/sql/mysql_schema.sql"
                 )
         except SQLAlchemyError as exc:
             raise RuntimeError("无法连接 MySQL，请检查 MYSQL_* 配置") from exc
+
+        self.storage_root.mkdir(parents=True, exist_ok=True)
+        qdrant_client_class, _ = self._import_qdrant()
+        self.qdrant_client = qdrant_client_class(
+            url=config.QDRANT_URL,
+            api_key=config.QDRANT_API_KEY,
+        )
+        try:
+            self.qdrant_client.get_collections()
+        except Exception as exc:
+            raise RuntimeError("无法连接 Qdrant，请检查 QDRANT_* 配置") from exc
 
     def create_knowledge_base(
         self, payload: KnowledgeBaseCreateRequest
@@ -100,6 +218,140 @@ class KnowledgeBaseService:
             total=total,
         )
 
+    def list_knowledge_base_options(self) -> list[KnowledgeBaseReference]:
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            items = session.scalars(
+                select(KnowledgeBase).order_by(KnowledgeBase.created_at.desc())
+            ).all()
+        return [KnowledgeBaseReference(id=item.id, name=item.name) for item in items]
+
+    def list_knowledge_base_documents(
+        self, knowledge_base_id: str
+    ) -> KnowledgeBaseDocumentListResponse:
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            self._get_knowledge_base_or_404(session, knowledge_base_id)
+            items = session.scalars(
+                select(KnowledgeBaseDocument)
+                .where(KnowledgeBaseDocument.knowledge_base_id == knowledge_base_id)
+                .order_by(
+                    KnowledgeBaseDocument.created_at.desc(),
+                    KnowledgeBaseDocument.id.desc(),
+                )
+            ).all()
+
+        return KnowledgeBaseDocumentListResponse(
+            knowledge_base_id=knowledge_base_id,
+            items=[self._to_document_summary(item) for item in items],
+        )
+
+    def upload_knowledge_base_document(
+        self, knowledge_base_id: str, file: UploadFile
+    ) -> KnowledgeBaseDocumentUploadResponse:
+        original_filename = self._normalize_upload_filename(file.filename)
+        self._validate_document_extension(original_filename)
+        file_bytes = file.file.read()
+        file_size = len(file_bytes)
+
+        if file_size == 0:
+            raise HTTPException(status_code=400, detail="上传文件不能为空")
+        if file_size > config.MAX_DOCUMENT_SIZE_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"文件大小不能超过 {config.MAX_DOCUMENT_SIZE_BYTES // (1024 * 1024)}MB",
+            )
+
+        document_id = uuid.uuid4().hex
+        stored_filename = self._build_stored_filename(document_id, original_filename)
+        storage_path = str(self._build_document_path(knowledge_base_id, stored_filename))
+        now = utc_now()
+
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            knowledge_base = self._get_knowledge_base_or_404(session, knowledge_base_id)
+            replaced_document = session.scalar(
+                select(KnowledgeBaseDocument).where(
+                    KnowledgeBaseDocument.knowledge_base_id == knowledge_base_id,
+                    KnowledgeBaseDocument.original_filename == original_filename,
+                )
+            )
+            replaced_snapshot = (
+                self._document_snapshot(replaced_document) if replaced_document is not None else None
+            )
+
+            if replaced_document is not None:
+                session.delete(replaced_document)
+
+            document = KnowledgeBaseDocument(
+                id=document_id,
+                knowledge_base_id=knowledge_base_id,
+                original_filename=original_filename,
+                stored_filename=stored_filename,
+                content_type=file.content_type,
+                file_size=file_size,
+                storage_path=storage_path,
+                status=PROCESSING_STATUS,
+                chunk_count=0,
+                error_message=None,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(document)
+
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                session.rollback()
+                raise HTTPException(
+                    status_code=409, detail="同名文档正在处理中，请稍后重试"
+                ) from exc
+
+            knowledge_base_config = dict(knowledge_base.config or {})
+
+        try:
+            if replaced_snapshot is not None:
+                self._delete_document_artifacts(replaced_snapshot)
+
+            self._save_document_bytes(knowledge_base_id, stored_filename, file_bytes)
+            text = self._extract_document_text(original_filename, file_bytes)
+            chunks = self._split_document_text(knowledge_base_config, text)
+            vectors = self._embed_document_chunks(knowledge_base_config, chunks)
+            collection_name = self._collection_name(knowledge_base_id)
+            self._ensure_collection(collection_name, len(vectors[0]))
+            self._upsert_document_chunks(
+                collection_name=collection_name,
+                knowledge_base_id=knowledge_base_id,
+                document_id=document_id,
+                original_filename=original_filename,
+                chunks=chunks,
+                vectors=vectors,
+            )
+        except HTTPException as exc:
+            self._safe_delete_document_vectors(knowledge_base_id, document_id)
+            self._mark_document_failed(knowledge_base_id, document_id, exc.detail)
+            raise
+        except Exception as exc:
+            self._safe_delete_document_vectors(knowledge_base_id, document_id)
+            self._mark_document_failed(knowledge_base_id, document_id, str(exc))
+            raise HTTPException(status_code=502, detail="文档处理失败") from exc
+
+        with session_factory() as session:
+            knowledge_base = self._get_knowledge_base_or_404(session, knowledge_base_id)
+            document = self._get_document_or_404(session, document_id)
+            document.status = READY_STATUS
+            document.chunk_count = len(vectors)
+            document.error_message = None
+            document.updated_at = utc_now()
+            knowledge_base.document_count = self._count_ready_documents(session, knowledge_base_id)
+            knowledge_base.updated_at = utc_now()
+            session.commit()
+
+            return KnowledgeBaseDocumentUploadResponse(
+                document=self._to_document_summary(document),
+                knowledge_base=self._to_summary(knowledge_base),
+            )
+
     def _validate_settings(self) -> None:
         missing = []
         if not config.MYSQL_HOST:
@@ -110,6 +362,12 @@ class KnowledgeBaseService:
             missing.append("MYSQL_PASSWORD")
         if not config.MYSQL_DATABASE:
             missing.append("MYSQL_DATABASE")
+        if not config.DASHSCOPE_API_KEY:
+            missing.append("DASHSCOPE_API_KEY")
+        if not config.EMBEDDING_BASE_URL:
+            missing.append("EMBEDDING_BASE_URL 或 DASHSCOPE_BASE_URL")
+        if not config.QDRANT_URL:
+            missing.append("QDRANT_URL")
         if missing:
             raise RuntimeError(f"缺少必要环境变量: {', '.join(missing)}")
 
@@ -131,6 +389,277 @@ class KnowledgeBaseService:
             return None
         return normalized
 
+    def _normalize_upload_filename(self, filename: str | None) -> str:
+        normalized = Path(filename or "").name.strip()
+        if not normalized:
+            raise HTTPException(status_code=400, detail="文件名不能为空")
+        if len(normalized) > 255:
+            raise HTTPException(status_code=400, detail="文件名不能超过 255 个字符")
+        return normalized
+
+    def _validate_document_extension(self, filename: str) -> None:
+        if Path(filename).suffix.lower() not in ALLOWED_DOCUMENT_EXTENSIONS:
+            raise HTTPException(status_code=400, detail="仅支持上传 TXT、MD、PDF 文件")
+
+    def _build_stored_filename(self, document_id: str, original_filename: str) -> str:
+        sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", original_filename).strip("._")
+        if not sanitized:
+            sanitized = f"document{Path(original_filename).suffix.lower()}"
+        return f"{document_id}_{sanitized}"
+
+    def _build_document_path(self, knowledge_base_id: str, stored_filename: str) -> Path:
+        return self.storage_root / knowledge_base_id / stored_filename
+
+    def _save_document_bytes(
+        self, knowledge_base_id: str, stored_filename: str, file_bytes: bytes
+    ) -> None:
+        document_dir = self.storage_root / knowledge_base_id
+        document_dir.mkdir(parents=True, exist_ok=True)
+        document_path = document_dir / stored_filename
+        document_path.write_bytes(file_bytes)
+
+    def _extract_document_text(self, filename: str, file_bytes: bytes) -> str:
+        suffix = Path(filename).suffix.lower()
+        if suffix in {".txt", ".md"}:
+            try:
+                text = file_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise HTTPException(
+                    status_code=400, detail="TXT/MD 文件必须使用 UTF-8 编码"
+                ) from exc
+        elif suffix == ".pdf":
+            try:
+                from pypdf import PdfReader
+            except ModuleNotFoundError as exc:
+                raise HTTPException(
+                    status_code=500, detail="服务端缺少 pypdf 依赖，暂时无法解析 PDF 文件"
+                ) from exc
+            reader = PdfReader(BytesIO(file_bytes))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        else:
+            raise HTTPException(status_code=400, detail="不支持的文件类型")
+
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="文档解析后没有可用文本内容")
+        return text
+
+    def _split_document_text(self, knowledge_base_config: dict[str, Any], text: str) -> list[str]:
+        chunk_size = int(knowledge_base_config.get("chunk_size") or DEFAULT_CHUNK_SIZE)
+        chunk_overlap = int(
+            knowledge_base_config.get("chunk_overlap") or DEFAULT_CHUNK_OVERLAP
+        )
+        if chunk_overlap >= chunk_size:
+            raise HTTPException(status_code=400, detail="chunk_overlap 必须小于 chunk_size")
+
+        separators: list[str] = []
+        separator = self._decode_separator(knowledge_base_config.get("separator"))
+        if separator:
+            separators.append(separator)
+        for default_separator in DEFAULT_SEPARATORS:
+            if default_separator not in separators:
+                separators.append(default_separator)
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=separators,
+        )
+        chunks = [
+            chunk.strip()
+            for chunk in splitter.split_text(text)
+            if chunk and chunk.strip()
+        ]
+        if not chunks:
+            raise HTTPException(status_code=400, detail="文档切分后没有可入库的文本块")
+        return chunks
+
+    def _decode_separator(self, separator: Any) -> str | None:
+        if not isinstance(separator, str) or not separator:
+            return None
+        try:
+            return bytes(separator, "utf-8").decode("unicode_escape")
+        except UnicodeDecodeError:
+            return separator
+
+    def _embed_document_chunks(
+        self, knowledge_base_config: dict[str, Any], chunks: list[str]
+    ) -> list[list[float]]:
+        embedding_model = (
+            knowledge_base_config.get("embedding_model") or DEFAULT_EMBEDDING_MODEL
+        )
+        embeddings = OpenAIEmbeddings(
+            model=embedding_model,
+            api_key=config.DASHSCOPE_API_KEY,
+            base_url=config.EMBEDDING_BASE_URL,
+            chunk_size=10,                   # 关键：限制每次最多 10 条
+            check_embedding_ctx_length=False, # 对兼容 OpenAI 的非 OpenAI 提供方更稳妥
+        )
+        try:
+            return embeddings.embed_documents(chunks)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"文档向量化失败: {exc}") from exc
+
+
+    def _ensure_collection(self, collection_name: str, vector_size: int) -> None:
+        client = self._get_qdrant_client()
+        _, qdrant_models = self._import_qdrant()
+        if self._collection_exists(collection_name):
+            return
+        try:
+            client.create_collection(
+                collection_name=collection_name,
+                vectors_config=qdrant_models.VectorParams(
+                    size=vector_size,
+                    distance=qdrant_models.Distance.COSINE,
+                ),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail="创建 Qdrant collection 失败") from exc
+
+    def _collection_exists(self, collection_name: str) -> bool:
+        client = self._get_qdrant_client()
+        try:
+            if hasattr(client, "collection_exists"):
+                return bool(client.collection_exists(collection_name=collection_name))
+            client.get_collection(collection_name=collection_name)
+            return True
+        except Exception:
+            return False
+
+    def _upsert_document_chunks(
+        self,
+        collection_name: str,
+        knowledge_base_id: str,
+        document_id: str,
+        original_filename: str,
+        chunks: list[str],
+        vectors: list[list[float]],
+    ) -> None:
+        client = self._get_qdrant_client()
+        _, qdrant_models = self._import_qdrant()
+        points = [
+            qdrant_models.PointStruct(
+                id=self._build_chunk_point_id(document_id, index),
+                vector=vector,
+                payload={
+                    "knowledge_base_id": knowledge_base_id,
+                    "document_id": document_id,
+                    "original_filename": original_filename,
+                    "chunk_index": index,
+                    "text": chunk,
+                },
+            )
+            for index, (chunk, vector) in enumerate(zip(chunks, vectors, strict=True))
+        ]
+        try:
+            client.upsert(collection_name=collection_name, points=points, wait=True)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"写入 Qdrant 失败: {exc}") from exc
+
+    def _build_chunk_point_id(self, document_id: str, chunk_index: int) -> str:
+        # Qdrant 只接受无符号整数或 UUID 作为 point ID，这里生成稳定 UUID。
+        namespace = uuid.UUID(hex=document_id)
+        return str(uuid.uuid5(namespace, str(chunk_index)))
+
+    def _delete_document_artifacts(self, document_snapshot: dict[str, str]) -> None:
+        self._delete_document_vectors(
+            document_snapshot["knowledge_base_id"], document_snapshot["id"]
+        )
+        self._delete_local_document_file(document_snapshot["storage_path"])
+
+    def _delete_document_vectors(self, knowledge_base_id: str, document_id: str) -> None:
+        collection_name = self._collection_name(knowledge_base_id)
+        if not self._collection_exists(collection_name):
+            return
+
+        _, qdrant_models = self._import_qdrant()
+        selector = qdrant_models.FilterSelector(
+            filter=qdrant_models.Filter(
+                must=[
+                    qdrant_models.FieldCondition(
+                        key="document_id",
+                        match=qdrant_models.MatchValue(value=document_id),
+                    )
+                ]
+            )
+        )
+        self._get_qdrant_client().delete(
+            collection_name=collection_name,
+            points_selector=selector,
+            wait=True,
+        )
+
+    def _safe_delete_document_vectors(self, knowledge_base_id: str, document_id: str) -> None:
+        try:
+            self._delete_document_vectors(knowledge_base_id, document_id)
+        except Exception:
+            return
+
+    def _delete_local_document_file(self, storage_path: str) -> None:
+        path = Path(storage_path)
+        if path.exists():
+            path.unlink()
+
+    def _mark_document_failed(
+        self, knowledge_base_id: str, document_id: str, error_message: str
+    ) -> None:
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            knowledge_base = self._get_knowledge_base_or_404(session, knowledge_base_id)
+            document = self._get_document_or_404(session, document_id)
+            document.status = FAILED_STATUS
+            document.error_message = self._truncate_error_message(error_message)
+            document.updated_at = utc_now()
+            knowledge_base.document_count = self._count_ready_documents(session, knowledge_base_id)
+            knowledge_base.updated_at = utc_now()
+            session.commit()
+
+    def _truncate_error_message(self, error_message: str) -> str:
+        normalized = " ".join((error_message or "未知错误").split())
+        return normalized[:1000]
+
+    def _count_ready_documents(self, session, knowledge_base_id: str) -> int:
+        return session.scalar(
+            select(func.count(KnowledgeBaseDocument.id)).where(
+                KnowledgeBaseDocument.knowledge_base_id == knowledge_base_id,
+                KnowledgeBaseDocument.status == READY_STATUS,
+            )
+        ) or 0
+
+    def _collection_name(self, knowledge_base_id: str) -> str:
+        return f"{config.QDRANT_COLLECTION_PREFIX}_{knowledge_base_id}"
+
+    def _get_qdrant_client(self) -> Any:
+        if self.qdrant_client is None:
+            raise RuntimeError("Qdrant 客户端尚未初始化")
+        return self.qdrant_client
+
+    def _import_qdrant(self):
+        try:
+            from qdrant_client import QdrantClient, models as qdrant_models
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("缺少 qdrant-client 依赖，请先执行 uv sync") from exc
+        return QdrantClient, qdrant_models
+
+    def _get_knowledge_base_or_404(self, session, knowledge_base_id: str) -> KnowledgeBase:
+        knowledge_base = session.get(KnowledgeBase, knowledge_base_id)
+        if knowledge_base is None:
+            raise HTTPException(status_code=404, detail="知识库不存在")
+        return knowledge_base
+
+    def _get_document_or_404(self, session, document_id: str) -> KnowledgeBaseDocument:
+        document = session.get(KnowledgeBaseDocument, document_id)
+        if document is None:
+            raise HTTPException(status_code=404, detail="文档不存在")
+        return document
+
+    def _document_snapshot(self, document: KnowledgeBaseDocument) -> dict[str, str]:
+        return {
+            "id": document.id,
+            "knowledge_base_id": document.knowledge_base_id,
+            "storage_path": document.storage_path,
+        }
+
     def _to_summary(self, knowledge_base: KnowledgeBase) -> KnowledgeBaseSummary:
         return KnowledgeBaseSummary(
             id=knowledge_base.id,
@@ -140,4 +669,21 @@ class KnowledgeBaseService:
             document_count=knowledge_base.document_count,
             created_at=to_iso_string(knowledge_base.created_at),
             updated_at=to_iso_string(knowledge_base.updated_at),
+        )
+
+    def _to_document_summary(
+        self, document: KnowledgeBaseDocument
+    ) -> KnowledgeBaseDocumentSummary:
+        return KnowledgeBaseDocumentSummary(
+            id=document.id,
+            knowledge_base_id=document.knowledge_base_id,
+            original_filename=document.original_filename,
+            stored_filename=document.stored_filename,
+            content_type=document.content_type,
+            file_size=document.file_size,
+            status=document.status,
+            chunk_count=document.chunk_count,
+            error_message=document.error_message,
+            created_at=to_iso_string(document.created_at),
+            updated_at=to_iso_string(document.updated_at),
         )

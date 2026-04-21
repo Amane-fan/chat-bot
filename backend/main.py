@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend import config
@@ -6,10 +6,14 @@ from backend.schemas import (
     ChatExchangeResponse,
     ChatRequest,
     KnowledgeBaseCreateRequest,
+    KnowledgeBaseDocumentListResponse,
+    KnowledgeBaseDocumentUploadResponse,
     KnowledgeBaseListResponse,
+    KnowledgeBaseReference,
     KnowledgeBaseSummary,
     MessageRecord,
     SessionCreateRequest,
+    SessionKnowledgeBaseUpdateRequest,
     SessionRenameRequest,
     SessionSummary,
 )
@@ -56,7 +60,7 @@ def get_sessions() -> list[SessionSummary]:
 def create_session(payload: SessionCreateRequest) -> SessionSummary:
     """创建新会话。"""
 
-    return chat_service.create_session(payload.title)
+    return chat_service.create_session(payload.title, payload.knowledge_base_ids)
 
 
 @app.patch("/api/sessions/{session_id}", response_model=SessionSummary)
@@ -69,6 +73,17 @@ def rename_session(
     if not title:
         raise HTTPException(status_code=400, detail="会话标题不能为空")
     return chat_service.rename_session(session_id, title)
+
+
+@app.put("/api/sessions/{session_id}/knowledge-bases", response_model=SessionSummary)
+def replace_session_knowledge_bases(
+    session_id: str, payload: SessionKnowledgeBaseUpdateRequest
+) -> SessionSummary:
+    """完整替换一个会话绑定的知识库列表。"""
+
+    return chat_service.replace_session_knowledge_bases(
+        session_id, payload.knowledge_base_ids
+    )
 
 
 @app.delete("/api/sessions/{session_id}", status_code=204)
@@ -109,3 +124,36 @@ def list_knowledge_bases(page: int = 1, page_size: int = 10) -> KnowledgeBaseLis
 
     # 路由层只负责接收分页参数，实际分页规则由 service 统一控制。
     return knowledge_base_service.list_knowledge_bases(page, page_size)
+
+
+@app.get("/api/knowledge-bases/options", response_model=list[KnowledgeBaseReference])
+def list_knowledge_base_options() -> list[KnowledgeBaseReference]:
+    """返回聊天页选择器所需的全量轻量知识库列表。"""
+
+    return knowledge_base_service.list_knowledge_base_options()
+
+
+@app.get(
+    "/api/knowledge-bases/{knowledge_base_id}/documents",
+    response_model=KnowledgeBaseDocumentListResponse,
+)
+def list_knowledge_base_documents(
+    knowledge_base_id: str,
+) -> KnowledgeBaseDocumentListResponse:
+    """返回指定知识库下的文档列表。"""
+
+    return knowledge_base_service.list_knowledge_base_documents(knowledge_base_id)
+
+
+@app.post(
+    "/api/knowledge-bases/{knowledge_base_id}/documents",
+    response_model=KnowledgeBaseDocumentUploadResponse,
+    status_code=201,
+)
+def upload_knowledge_base_document(
+    knowledge_base_id: str,
+    file: UploadFile = File(...),
+) -> KnowledgeBaseDocumentUploadResponse:
+    """上传一个知识库文档并同步完成切分、向量化和入库。"""
+
+    return knowledge_base_service.upload_knowledge_base_document(knowledge_base_id, file)

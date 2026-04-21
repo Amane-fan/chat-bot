@@ -1,18 +1,24 @@
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI
-from sqlalchemy import func, inspect, select
+from sqlalchemy import delete, func, inspect, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from backend import config
 from backend.db import get_engine, get_session_factory, init_mysql
-from backend.models import ChatMessage, ChatSession
-from backend.schemas import ChatExchangeResponse, MessageRecord, SessionSummary
+from backend.models import ChatMessage, ChatSession, KnowledgeBase, SessionKnowledgeBase
+from backend.schemas import (
+    ChatExchangeResponse,
+    KnowledgeBaseReference,
+    MessageRecord,
+    SessionSummary,
+)
 
 
 def utc_now() -> datetime:
@@ -47,7 +53,7 @@ class ChatService:
             inspector = inspect(engine)
             missing_tables = [
                 table_name
-                for table_name in ("chat_sessions", "chat_messages")
+                for table_name in ("chat_sessions", "chat_messages", "session_knowledge_bases")
                 if not inspector.has_table(table_name)
             ]
             if missing_tables:
@@ -94,12 +100,21 @@ class ChatService:
                 .order_by(ChatSession.updated_at.desc())
             ).all()
 
+            session_ids = [chat_session.id for chat_session, _ in rows]
+            knowledge_base_map = self._list_knowledge_bases_for_sessions(session, session_ids)
+
         return [
-            self._session_summary_from_model(chat_session, int(message_count))
+            self._session_summary_from_model(
+                chat_session,
+                int(message_count),
+                knowledge_base_map.get(chat_session.id, []),
+            )
             for chat_session, message_count in rows
         ]
 
-    def create_session(self, title: str | None = None) -> SessionSummary:
+    def create_session(
+        self, title: str | None = None, knowledge_base_ids: list[str] | None = None
+    ) -> SessionSummary:
         """创建新会话，并写入初始元数据。"""
 
         now = utc_now()
@@ -112,10 +127,16 @@ class ChatService:
 
         session_factory = get_session_factory()
         with session_factory() as session:
+            normalized_knowledge_base_ids = self._normalize_knowledge_base_ids(knowledge_base_ids)
+            self._validate_knowledge_base_ids(session, normalized_knowledge_base_ids)
             session.add(chat_session)
+            session.flush()
+            self._replace_session_knowledge_base_links(
+                session, chat_session.id, normalized_knowledge_base_ids, now
+            )
             session.commit()
 
-        return self._session_summary_from_model(chat_session, 0)
+            return self._build_session_summary(session, chat_session, 0)
 
     def rename_session(self, session_id: str, title: str) -> SessionSummary:
         """修改会话标题，并刷新会话排序时间。"""
@@ -127,7 +148,7 @@ class ChatService:
             chat_session.updated_at = utc_now()
             message_count = self._count_messages(session, session_id)
             session.commit()
-            return self._session_summary_from_model(chat_session, message_count)
+            return self._build_session_summary(session, chat_session, message_count)
 
     def delete_session(self, session_id: str) -> None:
         """删除会话元数据和关联消息。"""
@@ -145,6 +166,23 @@ class ChatService:
         with session_factory() as session:
             self._get_session_or_404(session, session_id)
             return self._load_messages(session, session_id)
+
+    def replace_session_knowledge_bases(
+        self, session_id: str, knowledge_base_ids: list[str] | None = None
+    ) -> SessionSummary:
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            chat_session = self._get_session_or_404(session, session_id)
+            normalized_knowledge_base_ids = self._normalize_knowledge_base_ids(knowledge_base_ids)
+            self._validate_knowledge_base_ids(session, normalized_knowledge_base_ids)
+            now = utc_now()
+            self._replace_session_knowledge_base_links(
+                session, session_id, normalized_knowledge_base_ids, now
+            )
+            chat_session.updated_at = now
+            message_count = self._count_messages(session, session_id)
+            session.commit()
+            return self._build_session_summary(session, chat_session, message_count)
 
     def send_message(self, session_id: str, content: str) -> ChatExchangeResponse:
         """执行一次问答，并把用户消息和模型回复写入 MySQL。"""
@@ -189,7 +227,8 @@ class ChatService:
             session.add_all([user_message_model, assistant_message_model])
             session.commit()
 
-            summary = self._session_summary_from_model(
+            summary = self._build_session_summary(
+                session,
                 chat_session,
                 self._count_messages(session, session_id),
             )
@@ -237,7 +276,10 @@ class ChatService:
         return normalized or None
 
     def _session_summary_from_model(
-        self, chat_session: ChatSession, message_count: int
+        self,
+        chat_session: ChatSession,
+        message_count: int,
+        knowledge_bases: list[KnowledgeBaseReference],
     ) -> SessionSummary:
         return SessionSummary(
             id=chat_session.id,
@@ -245,6 +287,7 @@ class ChatService:
             created_at=to_iso_string(chat_session.created_at),
             updated_at=to_iso_string(chat_session.updated_at),
             message_count=message_count,
+            knowledge_bases=knowledge_bases,
         )
 
     def _message_record_from_model(self, message: ChatMessage) -> MessageRecord:
@@ -270,6 +313,92 @@ class ChatService:
         return session.scalar(
             select(func.count(ChatMessage.id)).where(ChatMessage.session_id == session_id)
         ) or 0
+
+    def _build_session_summary(
+        self, session: Session, chat_session: ChatSession, message_count: int | None = None
+    ) -> SessionSummary:
+        if message_count is None:
+            message_count = self._count_messages(session, chat_session.id)
+        knowledge_bases = self._list_knowledge_bases_for_sessions(session, [chat_session.id]).get(
+            chat_session.id, []
+        )
+        return self._session_summary_from_model(chat_session, message_count, knowledge_bases)
+
+    def _normalize_knowledge_base_ids(
+        self, knowledge_base_ids: list[str] | None
+    ) -> list[str]:
+        normalized_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for knowledge_base_id in knowledge_base_ids or []:
+            normalized_id = knowledge_base_id.strip()
+            if normalized_id in seen_ids:
+                continue
+            seen_ids.add(normalized_id)
+            normalized_ids.append(normalized_id)
+        return normalized_ids
+
+    def _validate_knowledge_base_ids(
+        self, session: Session, knowledge_base_ids: list[str]
+    ) -> None:
+        if not knowledge_base_ids:
+            return
+        existing_ids = set(
+            session.scalars(
+                select(KnowledgeBase.id).where(KnowledgeBase.id.in_(knowledge_base_ids))
+            ).all()
+        )
+        missing_ids = [knowledge_base_id for knowledge_base_id in knowledge_base_ids if knowledge_base_id not in existing_ids]
+        if missing_ids:
+            raise HTTPException(status_code=400, detail="存在无效的知识库 ID")
+
+    def _replace_session_knowledge_base_links(
+        self,
+        session: Session,
+        session_id: str,
+        knowledge_base_ids: list[str],
+        created_at: datetime,
+    ) -> None:
+        session.execute(
+            delete(SessionKnowledgeBase).where(SessionKnowledgeBase.session_id == session_id)
+        )
+        session.add_all(
+            [
+                SessionKnowledgeBase(
+                    session_id=session_id,
+                    knowledge_base_id=knowledge_base_id,
+                    sort_order=index,
+                    created_at=created_at,
+                )
+                for index, knowledge_base_id in enumerate(knowledge_base_ids)
+            ]
+        )
+
+    def _list_knowledge_bases_for_sessions(
+        self, session: Session, session_ids: list[str]
+    ) -> dict[str, list[KnowledgeBaseReference]]:
+        if not session_ids:
+            return {}
+
+        rows = session.execute(
+            select(
+                SessionKnowledgeBase.session_id,
+                KnowledgeBase.id,
+                KnowledgeBase.name,
+            )
+            .join(KnowledgeBase, KnowledgeBase.id == SessionKnowledgeBase.knowledge_base_id)
+            .where(SessionKnowledgeBase.session_id.in_(session_ids))
+            .order_by(
+                SessionKnowledgeBase.session_id.asc(),
+                SessionKnowledgeBase.sort_order.asc(),
+            )
+        ).all()
+
+        knowledge_base_map: dict[str, list[KnowledgeBaseReference]] = defaultdict(list)
+        for session_id, knowledge_base_id, knowledge_base_name in rows:
+            knowledge_base_map[session_id].append(
+                KnowledgeBaseReference(id=knowledge_base_id, name=knowledge_base_name)
+            )
+        return dict(knowledge_base_map)
 
     def _get_session_or_404(self, session: Session, session_id: str) -> ChatSession:
         chat_session = session.get(ChatSession, session_id)
