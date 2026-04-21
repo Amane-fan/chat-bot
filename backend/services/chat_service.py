@@ -1,3 +1,4 @@
+import json
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -264,6 +265,103 @@ class ChatService:
             ),
         )
 
+    def stream_message(self, session_id: str, content: str):
+        """流式执行一次问答，并在完整答案生成后持久化消息。"""
+
+        normalized_content = content.strip()
+        if not normalized_content:
+            raise HTTPException(status_code=400, detail="消息内容不能为空")
+
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            self._get_session_or_404(session, session_id)
+            history = self._load_history(session, session_id)
+            knowledge_bases = self._list_knowledge_bases_for_sessions(
+                session, [session_id]
+            ).get(session_id, [])
+
+        retrieved_chunks = self._retrieve_knowledge_chunks(
+            normalized_content, knowledge_bases
+        )
+        system_prompt = self._build_system_prompt(retrieved_chunks)
+        llm_payload = {
+            "system_prompt": system_prompt,
+            "question": normalized_content,
+            "history": history,
+        }
+
+        user_message_created_at = utc_now()
+        assistant_message_created_at = utc_now()
+        user_message = MessageRecord(
+            role="user",
+            content=normalized_content,
+            created_at=to_iso_string(user_message_created_at),
+        )
+        retrieved_chunk_records = self._to_retrieved_chunk_records(retrieved_chunks)
+        yield self._stream_event(
+            "metadata",
+            {
+                "user_message": user_message.model_dump(),
+                "retrieved_chunks": [
+                    chunk.model_dump() for chunk in retrieved_chunk_records
+                ],
+            },
+        )
+
+        answer_parts: list[str] = []
+        try:
+            for chunk in self._get_chain().stream(llm_payload):
+                if not chunk:
+                    continue
+                chunk_text = str(chunk)
+                answer_parts.append(chunk_text)
+                yield self._stream_event("token", {"content": chunk_text})
+        except Exception:
+            yield self._stream_event("error", {"detail": "模型调用失败"})
+            return
+
+        raw_answer = "".join(answer_parts)
+        answer = self._append_reference_section(raw_answer, retrieved_chunks)
+        reference_suffix = answer[len(raw_answer) :]
+        if reference_suffix:
+            yield self._stream_event("token", {"content": reference_suffix})
+
+        with session_factory() as session:
+            chat_session = self._get_session_or_404(session, session_id)
+            if chat_session.title == "新对话" and self._count_messages(session, session_id) == 0:
+                chat_session.title = self._build_session_title(normalized_content)
+            chat_session.updated_at = assistant_message_created_at
+
+            user_message_model = ChatMessage(
+                session_id=session_id,
+                role="user",
+                content=normalized_content,
+                created_at=user_message_created_at,
+            )
+            assistant_message_model = ChatMessage(
+                session_id=session_id,
+                role="assistant",
+                content=answer,
+                created_at=assistant_message_created_at,
+            )
+            session.add_all([user_message_model, assistant_message_model])
+            session.commit()
+
+            summary = self._build_session_summary(
+                session,
+                chat_session,
+                self._count_messages(session, session_id),
+            )
+
+        exchange = ChatExchangeResponse(
+            session=summary,
+            user_message=self._message_record_from_model(user_message_model),
+            assistant_message=self._message_record_from_model(
+                assistant_message_model, retrieved_chunks
+            ),
+        )
+        yield self._stream_event("done", {"exchange": exchange.model_dump()})
+
     def _validate_settings(self) -> None:
         """启动前校验关键环境变量，避免请求阶段才暴露配置问题。"""
 
@@ -287,6 +385,12 @@ class ChatService:
         if self.chain is None:
             raise RuntimeError("模型链尚未初始化")
         return self.chain
+
+    def _stream_event(self, event_type: str, payload: dict[str, Any]) -> str:
+        return json.dumps(
+            {"type": event_type, **payload},
+            ensure_ascii=False,
+        ) + "\n"
 
     def _retrieve_knowledge_chunks(
         self, question: str, knowledge_bases: list[KnowledgeBaseReference]

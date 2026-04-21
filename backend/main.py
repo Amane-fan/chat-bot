@@ -1,5 +1,6 @@
 from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from backend import config
 from backend.schemas import (
@@ -107,6 +108,16 @@ def send_message(session_id: str, payload: ChatRequest) -> ChatExchangeResponse:
     """发送消息并获取模型回复。"""
 
     return chat_service.send_message(session_id, payload.content)
+
+
+@app.post("/api/sessions/{session_id}/messages/stream")
+def stream_message(session_id: str, payload: ChatRequest) -> StreamingResponse:
+    """流式发送消息并获取模型回复。"""
+
+    return StreamingResponse(
+        chat_service.stream_message(session_id, payload.content),
+        media_type="application/x-ndjson",
+    )
 
 
 @app.post("/api/knowledge-bases", response_model=KnowledgeBaseSummary, status_code=201)

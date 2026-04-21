@@ -1,4 +1,4 @@
-# LangChain Chatbot
+# 知答舱
 
 一个基于 FastAPI、Vue、MySQL、Qdrant 和 LangChain 的聊天机器人示例项目。
 

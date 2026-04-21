@@ -119,8 +119,8 @@ button {
 }
 
 .stage-header h2 {
-  font-size: clamp(2.4rem, 4vw, 3.9rem);
-  line-height: 1;
+  font-size: clamp(1.55rem, 2.6vw, 2.45rem);
+  line-height: 1.08;
   color: var(--accent);
 }
 
@@ -389,10 +389,16 @@ button {
   padding-right: 4px;
 }
 
+.knowledge-list-scroll {
+  height: 100%;
+  padding: 4px 10px 28px 0;
+  scroll-padding-bottom: 28px;
+}
+
 .conversation-panel {
   display: grid;
-  grid-template-rows: auto 1fr auto;
-  gap: 14px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 10px;
 }
 
 .knowledge-editor {
@@ -403,6 +409,15 @@ button {
   display: grid;
   grid-template-rows: auto 1fr auto;
   gap: 14px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.knowledge-library .pager {
+  flex-shrink: 0;
+  padding-top: 8px;
+  border-top: 1px solid rgba(196, 188, 176, 0.24);
+  background: linear-gradient(180deg, rgba(250, 246, 240, 0), rgba(250, 246, 240, 0.72));
 }
 
 .primary-button,
@@ -483,6 +498,7 @@ button {
 .knowledge-card::before {
   position: absolute;
   inset: 0;
+  border-radius: inherit;
   background:
     linear-gradient(120deg, rgba(212, 225, 220, 0.14), transparent 44%),
     linear-gradient(20deg, rgba(233, 199, 180, 0.18), transparent 50%);
@@ -604,6 +620,9 @@ button {
 
 .knowledge-card {
   background: rgba(251, 249, 244, 0.72);
+  flex-shrink: 0;
+  overflow: visible;
+  isolation: isolate;
 }
 
 .knowledge-card p {
@@ -635,7 +654,12 @@ button {
   gap: 10px;
 }
 
+.knowledge-document-toolbar {
+  flex-wrap: wrap;
+}
+
 .knowledge-file-input {
+  flex: 1 1 320px;
   min-width: 0;
   padding: 8px 10px;
 }
@@ -932,7 +956,7 @@ button {
 .message-wall {
   min-height: 0;
   height: 100%;
-  padding: 20px;
+  padding: 18px 20px;
   border-radius: 30px;
   background: var(--paper-veil);
   border: 1px solid rgba(207, 214, 206, 0.38);
@@ -965,6 +989,19 @@ button {
     var(--assistant-card);
 }
 
+.message-card.streaming {
+  border-color: rgba(111, 148, 95, 0.28);
+}
+
+.message-card.streaming p::after {
+  display: inline-block;
+  width: 0.62em;
+  margin-left: 3px;
+  color: rgba(111, 148, 95, 0.9);
+  content: "▌";
+  animation: caretPulse 900ms steps(1) infinite;
+}
+
 .message-card p {
   margin: 0;
   line-height: 1.82;
@@ -978,17 +1015,35 @@ button {
   border-top: 1px solid rgba(129, 148, 122, 0.18);
 }
 
-.message-retrieval-title {
-  margin-bottom: 8px;
-  color: rgba(66, 82, 62, 0.76);
+.message-retrieval-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 11px;
+  color: rgba(66, 82, 62, 0.82);
+  background: rgba(251, 248, 242, 0.62);
+  border: 1px solid rgba(129, 148, 122, 0.2);
+  border-radius: 999px;
   font-size: 0.78rem;
   font-weight: 760;
+}
+
+.message-retrieval-toggle strong {
+  display: inline-grid;
+  min-width: 22px;
+  height: 22px;
+  place-items: center;
+  color: #fffaf7;
+  background: rgba(111, 148, 95, 0.78);
+  border-radius: 999px;
+  font-size: 0.72rem;
 }
 
 .message-retrieval-list {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  margin-top: 10px;
 }
 
 .message-retrieval-item {
@@ -1036,8 +1091,8 @@ button {
 }
 
 .composer {
-  padding: 14px;
-  border-radius: 28px;
+  padding: 10px 12px;
+  border-radius: 24px;
   background: rgba(250, 246, 240, 0.82);
   border: 1px solid rgba(207, 214, 206, 0.36);
   box-shadow: var(--shadow-soft);
@@ -1045,10 +1100,10 @@ button {
 
 .composer-input {
   resize: none;
-  min-height: 84px;
-  max-height: 140px;
-  padding: 13px 14px;
-  border-radius: 18px;
+  min-height: 58px;
+  max-height: 96px;
+  padding: 11px 13px;
+  border-radius: 16px;
   background: rgba(255, 253, 249, 0.95);
   overflow: auto;
 }
@@ -1073,6 +1128,12 @@ button {
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@keyframes caretPulse {
+  50% {
+    opacity: 0;
   }
 }
 

@@ -70,6 +70,70 @@ export function sendMessage(sessionId, content) {
   });
 }
 
+export async function sendMessageStream(sessionId, content, handlers = {}) {
+  const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/messages/stream`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ content }),
+  });
+
+  if (!response.ok) {
+    const contentType = response.headers.get("content-type") || "";
+    const data = contentType.includes("application/json")
+      ? await response.json()
+      : await response.text();
+    throw new Error(data?.detail || data || "请求失败");
+  }
+  if (!response.body) {
+    throw new Error("当前浏览器不支持流式响应");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let finalExchange = null;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.trim()) {
+        continue;
+      }
+      const event = JSON.parse(line);
+      if (event.type === "error") {
+        throw new Error(event.detail || "模型调用失败");
+      }
+      if (event.type === "done") {
+        finalExchange = event.exchange;
+      }
+      handlers[event.type]?.(event);
+    }
+  }
+
+  if (buffer.trim()) {
+    const event = JSON.parse(buffer);
+    if (event.type === "error") {
+      throw new Error(event.detail || "模型调用失败");
+    }
+    if (event.type === "done") {
+      finalExchange = event.exchange;
+    }
+    handlers[event.type]?.(event);
+  }
+
+  return finalExchange;
+}
+
 export function getKnowledgeBaseOptions() {
   return request("/knowledge-bases/options");
 }

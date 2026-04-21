@@ -11,7 +11,7 @@ import {
   getMessages,
   getSessions,
   renameSession,
-  sendMessage,
+  sendMessageStream,
   updateSessionKnowledgeBases,
   uploadKnowledgeBaseDocument,
 } from "./api";
@@ -63,6 +63,8 @@ const uploadingKnowledgeBaseDocumentIds = ref({});
 const deletingKnowledgeBaseDocumentIds = ref({});
 const pendingKnowledgeBaseFiles = ref({});
 const knowledgeBaseUploadInputKeys = ref({});
+const expandedRetrievalMessageIds = ref({});
+let messageClientIdSeed = 0;
 
 const activeSession = computed(
   () => sessions.value.find((session) => session.id === activeSessionId.value) || null,
@@ -358,14 +360,69 @@ async function submitRename(sessionId) {
 async function performSendMessage(sessionId, content) {
   sending.value = true;
   errorMessage.value = "";
+  const userClientId = buildMessageClientId("user");
+  const assistantClientId = buildMessageClientId("assistant");
+  let assistantStarted = false;
+
   try {
-    const exchange = await sendMessage(sessionId, content);
-    draft.value = "";
-    messages.value = [...messages.value, exchange.user_message, exchange.assistant_message];
-    upsertSessionSummary(exchange.session);
-    activeSessionId.value = exchange.session.id;
+    const exchange = await sendMessageStream(sessionId, content, {
+      metadata(event) {
+        draft.value = "";
+        messages.value = [
+          ...messages.value,
+          {
+            ...event.user_message,
+            client_id: userClientId,
+          },
+          {
+            role: "assistant",
+            content: "",
+            created_at: new Date().toISOString(),
+            retrieved_chunks: event.retrieved_chunks || [],
+            client_id: assistantClientId,
+            streaming: true,
+          },
+        ];
+      },
+      token(event) {
+        assistantStarted = true;
+        messages.value = messages.value.map((message) =>
+          message.client_id === assistantClientId
+            ? { ...message, content: `${message.content}${event.content || ""}` }
+            : message,
+        );
+      },
+      done(event) {
+        const finalExchange = event.exchange;
+        messages.value = messages.value.map((message) => {
+          if (message.client_id === userClientId) {
+            return { ...finalExchange.user_message, client_id: userClientId };
+          }
+          if (message.client_id === assistantClientId) {
+            return {
+              ...finalExchange.assistant_message,
+              client_id: assistantClientId,
+              streaming: false,
+            };
+          }
+          return message;
+        });
+        upsertSessionSummary(finalExchange.session);
+        activeSessionId.value = finalExchange.session.id;
+      },
+    });
+
+    if (exchange && !assistantStarted) {
+      upsertSessionSummary(exchange.session);
+      activeSessionId.value = exchange.session.id;
+    }
   } catch (error) {
     errorMessage.value = error.message;
+    messages.value = messages.value.map((message) =>
+      message.client_id === assistantClientId
+        ? { ...message, streaming: false, content: message.content || "模型调用失败" }
+        : message,
+    );
   } finally {
     sending.value = false;
   }
@@ -607,6 +664,30 @@ function formatRetrievalScore(score) {
   return `score ${Number(score).toFixed(3)}`;
 }
 
+function buildMessageClientId(role) {
+  messageClientIdSeed += 1;
+  return `${role}-${Date.now()}-${messageClientIdSeed}`;
+}
+
+function getMessageKey(message) {
+  return (
+    message.client_id ||
+    `${message.created_at}-${message.role}-${String(message.content || "").slice(0, 24)}`
+  );
+}
+
+function toggleMessageRetrieval(message) {
+  const key = getMessageKey(message);
+  expandedRetrievalMessageIds.value = {
+    ...expandedRetrievalMessageIds.value,
+    [key]: !expandedRetrievalMessageIds.value[key],
+  };
+}
+
+function isMessageRetrievalExpanded(message) {
+  return Boolean(expandedRetrievalMessageIds.value[getMessageKey(message)]);
+}
+
 onMounted(async () => {
   await switchView(currentView.value);
 });
@@ -616,11 +697,8 @@ onMounted(async () => {
   <div class="shell">
     <aside class="sidebar">
       <div class="brand">
-        <p class="eyebrow">Impression Study</p>
-        <h1>对话与知识库工作台</h1>
-        <p class="brand-copy">
-          把即时对话和知识库准备拆成两块独立界面。当前只专注一个任务，减少同屏干扰。
-        </p>
+        <p class="eyebrow">Knowledge Cabin</p>
+        <h1>知答舱</h1>
       </div>
 
       <nav class="view-switcher" aria-label="工作区切换">
@@ -629,7 +707,7 @@ onMounted(async () => {
           :class="{ active: currentView === 'chat' }"
           @click="switchView('chat')"
         >
-          <span>聊天界面</span>
+          <span>问答舱</span>
           <small>会话、消息、模型回复</small>
         </button>
         <button
@@ -637,7 +715,7 @@ onMounted(async () => {
           :class="{ active: currentView === 'knowledge' }"
           @click="switchView('knowledge')"
         >
-          <span>知识库界面</span>
+          <span>知识库</span>
           <small>元数据、配置、分页列表</small>
         </button>
       </nav>
@@ -651,7 +729,7 @@ onMounted(async () => {
         <article class="sidebar-card">
           <span>知识库数</span>
           <strong>{{ knowledgeBaseTotal }}</strong>
-          <p>知识库界面单独负责元数据创建与管理。</p>
+          <p>知识库独立负责元数据创建与管理。</p>
         </article>
       </div>
     </aside>
@@ -663,10 +741,9 @@ onMounted(async () => {
 
         <header class="stage-header">
           <div>
-            <p class="eyebrow chat-eyebrow">Conversation Atelier</p>
-            <h2>{{ activeSession?.title || "聊天界面" }}</h2>
+            <p class="eyebrow chat-eyebrow">Answer Cabin</p>
+            <h2>{{ activeSession?.title || "问答舱" }}</h2>
           </div>
-          <p class="hint">会话先绑定知识库范围，当前阶段仅保存关系，为后续检索预留入口。</p>
         </header>
 
         <div class="chat-layout" :class="{ 'sessions-collapsed': sessionListCollapsed }">
@@ -757,9 +834,9 @@ onMounted(async () => {
               </div>
               <article
                 v-for="message in messages"
-                :key="`${message.created_at}-${message.role}-${message.content}`"
+                :key="getMessageKey(message)"
                 class="message-card"
-                :class="message.role"
+                :class="[message.role, { streaming: message.streaming }]"
               >
                 <div class="message-meta">
                   <time>{{ formatTime(message.created_at) }}</time>
@@ -769,8 +846,18 @@ onMounted(async () => {
                   v-if="message.retrieved_chunks?.length"
                   class="message-retrieval"
                 >
-                  <div class="message-retrieval-title">本次命中的知识库片段</div>
-                  <div class="message-retrieval-list">
+                  <button
+                    class="message-retrieval-toggle"
+                    @click="toggleMessageRetrieval(message)"
+                  >
+                    <span>本次命中的知识库片段</span>
+                    <strong>{{ message.retrieved_chunks.length }}</strong>
+                    <span>{{ isMessageRetrievalExpanded(message) ? "收起" : "展开" }}</span>
+                  </button>
+                  <div
+                    v-if="isMessageRetrievalExpanded(message)"
+                    class="message-retrieval-list"
+                  >
                     <section
                       v-for="(chunk, index) in message.retrieved_chunks"
                       :key="`${chunk.document_id}-${chunk.chunk_index}-${index}`"
@@ -800,7 +887,7 @@ onMounted(async () => {
                 @keydown.enter.exact.prevent="handleSendMessage"
               />
               <div class="composer-actions">
-                <span>FastAPI + Vue + MySQL</span>
+                <span>知答舱 · RAG Workspace</span>
                 <button
                   class="primary-button composer-button"
                   :disabled="sending"
@@ -820,8 +907,8 @@ onMounted(async () => {
 
         <header class="stage-header">
           <div>
-            <p class="eyebrow chat-eyebrow">Knowledge Studio</p>
-            <h2>知识库界面</h2>
+            <p class="eyebrow chat-eyebrow">Knowledge Hold</p>
+            <h2>知识库</h2>
           </div>
           <p class="hint">在这里创建知识库，并把文档按对应分块和 embedding 配置同步写入 Qdrant。</p>
         </header>
