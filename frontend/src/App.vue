@@ -112,7 +112,7 @@ function createDefaultKnowledgeBaseForm() {
   return {
     name: "",
     description: "",
-    embedding_model: "text-embedding-v1",
+    embedding_model: "text-embedding-v4",
     chunk_size: 500,
     chunk_overlap: 50,
     separator: "\\n\\n",
@@ -1040,7 +1040,7 @@ onMounted(async () => {
                   <input
                     v-model="knowledgeBaseForm.embedding_model"
                     class="field-input"
-                    placeholder="text-embedding-v1"
+                    placeholder="text-embedding-v4"
                   />
                 </label>
 

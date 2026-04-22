@@ -268,7 +268,7 @@ npm run dev
   "name": "产品文档库",
   "description": "用于存放产品手册和 FAQ",
   "config": {
-    "embedding_model": "text-embedding-v1",
+    "embedding_model": "text-embedding-v4",
     "chunk_size": 500,
     "chunk_overlap": 50,
     "separator": "\\n\\n"
