@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import shutil
 import time
 import uuid
 from io import BytesIO
@@ -24,6 +25,7 @@ from backend.schemas import (
     KnowledgeBaseListResponse,
     KnowledgeBaseReference,
     KnowledgeBaseSummary,
+    KnowledgeBaseUpdateRequest,
 )
 
 DEFAULT_EMBEDDING_MODEL = "text-embedding-v1"
@@ -201,6 +203,46 @@ class KnowledgeBaseService:
                 # 名称唯一约束最终以数据库为准，避免并发下只靠应用层校验。
                 raise HTTPException(status_code=409, detail="知识库名称已存在") from exc
             return self._to_summary(knowledge_base)
+
+    def update_knowledge_base(
+        self, knowledge_base_id: str, payload: KnowledgeBaseUpdateRequest
+    ) -> KnowledgeBaseSummary:
+        """编辑知识库基础信息，配置项创建后保持不变。"""
+
+        name = self._normalize_name(payload.name)
+        description = self._normalize_description(payload.description)
+
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            knowledge_base = self._get_knowledge_base_or_404(session, knowledge_base_id)
+            knowledge_base.name = name
+            knowledge_base.description = description
+            knowledge_base.updated_at = utc_now()
+
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                session.rollback()
+                raise HTTPException(status_code=409, detail="知识库名称已存在") from exc
+
+            return self._to_summary(knowledge_base)
+
+    def delete_knowledge_base(self, knowledge_base_id: str) -> None:
+        """硬删除知识库，并清理 Qdrant collection 和本地文件目录。"""
+
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            self._get_knowledge_base_or_404(session, knowledge_base_id)
+
+        try:
+            self._delete_knowledge_base_artifacts(knowledge_base_id)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail="删除知识库资源失败") from exc
+
+        with session_factory() as session:
+            knowledge_base = self._get_knowledge_base_or_404(session, knowledge_base_id)
+            session.delete(knowledge_base)
+            session.commit()
 
     def list_knowledge_bases(self, page: int, page_size: int) -> KnowledgeBaseListResponse:
         if page < 1 or page_size < 1:
@@ -851,6 +893,16 @@ class KnowledgeBaseService:
         )
         self._delete_local_document_file(document_snapshot["storage_path"])
 
+    def _delete_knowledge_base_artifacts(self, knowledge_base_id: str) -> None:
+        self._delete_knowledge_base_collection(knowledge_base_id)
+        self._delete_local_knowledge_base_dir(knowledge_base_id)
+
+    def _delete_knowledge_base_collection(self, knowledge_base_id: str) -> None:
+        collection_name = self._collection_name(knowledge_base_id)
+        if not self._collection_exists(collection_name):
+            return
+        self._get_qdrant_client().delete_collection(collection_name=collection_name)
+
     def _delete_document_vectors(self, knowledge_base_id: str, document_id: str) -> None:
         collection_name = self._collection_name(knowledge_base_id)
         if not self._collection_exists(collection_name):
@@ -883,6 +935,11 @@ class KnowledgeBaseService:
         path = Path(storage_path)
         if path.exists():
             path.unlink()
+
+    def _delete_local_knowledge_base_dir(self, knowledge_base_id: str) -> None:
+        path = self.storage_root / knowledge_base_id
+        if path.exists():
+            shutil.rmtree(path)
 
     def _mark_document_failed(
         self, knowledge_base_id: str, document_id: str, error_message: str

@@ -139,6 +139,13 @@ button {
   color: var(--ink-soft);
 }
 
+.hint,
+.panel-header,
+.knowledge-list-header span,
+.pager span {
+  font-weight: 600;
+}
+
 .brand-copy {
   max-width: 24ch;
   margin: 14px 0 0;
@@ -441,6 +448,7 @@ button {
   color: var(--accent-deep);
   background: linear-gradient(135deg, #f4e4d5, #fbf7f0);
   border: 1px solid rgba(210, 177, 154, 0.35);
+  font-weight: 650;
 }
 
 .pager-button {
@@ -552,9 +560,10 @@ button {
 
 .ghost-button {
   padding: 0;
-  color: rgba(98, 105, 96, 0.74);
+  color: rgba(83, 91, 83, 0.82);
   background: transparent;
   font-size: 0.82rem;
+  font-weight: 650;
 }
 
 .ghost-button:disabled {
@@ -572,6 +581,8 @@ button {
   width: 100%;
   border: 1px solid var(--frame);
   outline: none;
+  color: rgba(45, 51, 45, 0.92);
+  font-weight: 560;
   transition: border-color 180ms ease, box-shadow 180ms ease, background 180ms ease;
 }
 
@@ -600,6 +611,28 @@ button {
   border: 1px solid rgba(255, 255, 255, 0.7);
 }
 
+.knowledge-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.knowledge-form-actions .secondary-button {
+  flex: 1 1 auto;
+}
+
+.knowledge-form-note {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 14px;
+  color: rgba(69, 77, 69, 0.9);
+  background: rgba(255, 253, 249, 0.72);
+  border: 1px dashed rgba(152, 165, 152, 0.26);
+  font-size: 0.82rem;
+  font-weight: 600;
+  line-height: 1.6;
+}
+
 .field-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -611,7 +644,8 @@ button {
   flex-direction: column;
   gap: 6px;
   font-size: 0.85rem;
-  color: rgba(65, 73, 67, 0.84);
+  color: rgba(53, 61, 55, 0.9);
+  font-weight: 650;
 }
 
 .field-area {
@@ -625,11 +659,41 @@ button {
   isolation: isolate;
 }
 
+.knowledge-card-title {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.knowledge-card-title strong {
+  overflow-wrap: anywhere;
+  font-weight: 760;
+}
+
+.knowledge-card-actions {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.knowledge-card-actions .ghost-button,
+.knowledge-form-actions .ghost-button {
+  padding: 7px 10px;
+  border-radius: 999px;
+  background: rgba(255, 253, 249, 0.62);
+  border: 1px solid rgba(196, 188, 176, 0.26);
+}
+
 .knowledge-card p {
   position: relative;
   z-index: 1;
   margin: 0;
-  color: rgba(68, 74, 69, 0.82);
+  color: rgba(55, 63, 57, 0.9);
+  font-weight: 560;
   line-height: 1.7;
 }
 
@@ -682,8 +746,9 @@ button {
 
 .knowledge-upload-copy,
 .knowledge-document-meta {
-  color: rgba(84, 91, 83, 0.82);
+  color: rgba(67, 76, 68, 0.88);
   font-size: 0.8rem;
+  font-weight: 600;
 }
 
 .knowledge-document-list {
@@ -704,6 +769,7 @@ button {
 
 .knowledge-document-header strong {
   font-size: 0.95rem;
+  font-weight: 720;
   line-height: 1.4;
   min-width: 0;
   overflow-wrap: anywhere;
@@ -731,6 +797,7 @@ button {
   padding: 6px 10px;
   border-radius: 999px;
   font-size: 0.74rem;
+  font-weight: 700;
   line-height: 1;
 }
 
@@ -758,6 +825,7 @@ button {
   position: relative;
   z-index: 1;
   font-size: 0.78rem;
+  font-weight: 650;
 }
 
 .knowledge-empty {
@@ -1265,6 +1333,12 @@ button {
   .session-modal-submit,
   .session-modal-secondary {
     width: 100%;
+  }
+
+  .knowledge-card-actions,
+  .knowledge-form-actions {
+    width: 100%;
+    flex-wrap: wrap;
   }
 
   .floating-study {

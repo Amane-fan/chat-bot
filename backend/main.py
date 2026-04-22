@@ -13,6 +13,7 @@ from backend.schemas import (
     KnowledgeBaseListResponse,
     KnowledgeBaseReference,
     KnowledgeBaseSummary,
+    KnowledgeBaseUpdateRequest,
     MessageRecord,
     SessionCreateRequest,
     SessionKnowledgeBaseUpdateRequest,
@@ -143,6 +144,23 @@ def list_knowledge_base_options() -> list[KnowledgeBaseReference]:
     """返回聊天页选择器所需的全量轻量知识库列表。"""
 
     return knowledge_base_service.list_knowledge_base_options()
+
+
+@app.patch("/api/knowledge-bases/{knowledge_base_id}", response_model=KnowledgeBaseSummary)
+def update_knowledge_base(
+    knowledge_base_id: str, payload: KnowledgeBaseUpdateRequest
+) -> KnowledgeBaseSummary:
+    """编辑知识库基础信息。"""
+
+    return knowledge_base_service.update_knowledge_base(knowledge_base_id, payload)
+
+
+@app.delete("/api/knowledge-bases/{knowledge_base_id}", status_code=204)
+def delete_knowledge_base(knowledge_base_id: str) -> Response:
+    """硬删除知识库，并清理关联文档和向量资源。"""
+
+    knowledge_base_service.delete_knowledge_base(knowledge_base_id)
+    return Response(status_code=204)
 
 
 @app.get(

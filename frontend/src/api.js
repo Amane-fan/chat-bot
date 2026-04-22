@@ -149,6 +149,19 @@ export function createKnowledgeBase(payload) {
   });
 }
 
+export function updateKnowledgeBase(knowledgeBaseId, payload) {
+  return request(`/knowledge-bases/${knowledgeBaseId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteKnowledgeBase(knowledgeBaseId) {
+  return request(`/knowledge-bases/${knowledgeBaseId}`, {
+    method: "DELETE",
+  });
+}
+
 export function getKnowledgeBaseDocuments(knowledgeBaseId) {
   return request(`/knowledge-bases/${knowledgeBaseId}/documents`);
 }

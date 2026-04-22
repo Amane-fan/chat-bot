@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from "vue";
 import {
   createKnowledgeBase,
   createSession,
+  deleteKnowledgeBase,
   deleteKnowledgeBaseDocument,
   deleteSession,
   getKnowledgeBaseDocuments,
@@ -12,6 +13,7 @@ import {
   getSessions,
   renameSession,
   sendMessageStream,
+  updateKnowledgeBase,
   updateSessionKnowledgeBases,
   uploadKnowledgeBaseDocument,
 } from "./api";
@@ -49,14 +51,9 @@ const knowledgeBasePageSize = ref(5);
 const knowledgeBaseTotal = ref(0);
 const loadingKnowledgeBases = ref(false);
 const creatingKnowledgeBase = ref(false);
-const knowledgeBaseForm = ref({
-  name: "",
-  description: "",
-  embedding_model: "text-embedding-v1",
-  chunk_size: 500,
-  chunk_overlap: 50,
-  separator: "\\n\\n",
-});
+const editingKnowledgeBaseId = ref("");
+const deletingKnowledgeBaseIds = ref({});
+const knowledgeBaseForm = ref(createDefaultKnowledgeBaseForm());
 const knowledgeBaseDocuments = ref({});
 const loadingKnowledgeBaseDocumentIds = ref({});
 const uploadingKnowledgeBaseDocumentIds = ref({});
@@ -72,6 +69,16 @@ const activeSession = computed(
 const knowledgeBaseTotalPages = computed(() =>
   Math.max(1, Math.ceil(knowledgeBaseTotal.value / knowledgeBasePageSize.value)),
 );
+const isEditingKnowledgeBase = computed(() => Boolean(editingKnowledgeBaseId.value));
+const knowledgeBaseFormHeading = computed(() =>
+  isEditingKnowledgeBase.value ? "编辑知识库" : "知识库工坊",
+);
+const knowledgeBaseFormSubmitLabel = computed(() => {
+  if (creatingKnowledgeBase.value) {
+    return isEditingKnowledgeBase.value ? "保存中..." : "创建中...";
+  }
+  return isEditingKnowledgeBase.value ? "保存修改" : "创建知识库";
+});
 const sessionModalHeading = computed(() =>
   sessionModalMode.value === "create" ? "新建会话" : "编辑会话知识库",
 );
@@ -99,6 +106,17 @@ function syncViewHash(view) {
   if (window.location.hash !== nextHash) {
     window.history.replaceState(null, "", nextHash);
   }
+}
+
+function createDefaultKnowledgeBaseForm() {
+  return {
+    name: "",
+    description: "",
+    embedding_model: "text-embedding-v1",
+    chunk_size: 500,
+    chunk_overlap: 50,
+    separator: "\\n\\n",
+  };
 }
 
 async function loadSessions(preferredSessionId = "") {
@@ -442,7 +460,36 @@ async function handleSendMessage() {
   await performSendMessage(activeSessionId.value, content);
 }
 
-async function handleCreateKnowledgeBase() {
+function resetKnowledgeBaseForm() {
+  editingKnowledgeBaseId.value = "";
+  knowledgeBaseForm.value = createDefaultKnowledgeBaseForm();
+}
+
+function startEditKnowledgeBase(item) {
+  errorMessage.value = "";
+  editingKnowledgeBaseId.value = item.id;
+  knowledgeBaseForm.value = {
+    ...createDefaultKnowledgeBaseForm(),
+    name: item.name,
+    description: item.description || "",
+  };
+}
+
+function cancelEditKnowledgeBase() {
+  resetKnowledgeBaseForm();
+}
+
+async function refreshKnowledgeBaseReferences() {
+  knowledgeOptionsLoaded.value = false;
+  if (sessionModalVisible.value) {
+    await loadKnowledgeBaseOptions(true);
+  }
+  if (chatInitialized.value) {
+    await loadSessions(activeSessionId.value);
+  }
+}
+
+async function handleSubmitKnowledgeBaseForm() {
   if (creatingKnowledgeBase.value) {
     return;
   }
@@ -450,7 +497,20 @@ async function handleCreateKnowledgeBase() {
   creatingKnowledgeBase.value = true;
   errorMessage.value = "";
   try {
-    const payload = {
+    if (isEditingKnowledgeBase.value) {
+      await updateKnowledgeBase(editingKnowledgeBaseId.value, {
+        name: knowledgeBaseForm.value.name,
+        description: knowledgeBaseForm.value.description,
+      });
+      resetKnowledgeBaseForm();
+      await Promise.all([
+        loadKnowledgeBases(knowledgeBasePage.value),
+        refreshKnowledgeBaseReferences(),
+      ]);
+      return;
+    }
+
+    await createKnowledgeBase({
       name: knowledgeBaseForm.value.name,
       description: knowledgeBaseForm.value.description,
       config: {
@@ -459,22 +519,53 @@ async function handleCreateKnowledgeBase() {
         chunk_overlap: Number(knowledgeBaseForm.value.chunk_overlap),
         separator: knowledgeBaseForm.value.separator || undefined,
       },
-    };
-    await createKnowledgeBase(payload);
-    knowledgeBaseForm.value = {
-      name: "",
-      description: "",
-      embedding_model: "text-embedding-v1",
-      chunk_size: 500,
-      chunk_overlap: 50,
-      separator: "\\n\\n",
-    };
-    knowledgeOptionsLoaded.value = false;
-    await loadKnowledgeBases(1);
+    });
+    resetKnowledgeBaseForm();
+    await Promise.all([loadKnowledgeBases(1), refreshKnowledgeBaseReferences()]);
   } catch (error) {
     errorMessage.value = error.message;
   } finally {
     creatingKnowledgeBase.value = false;
+  }
+}
+
+async function handleDeleteKnowledgeBase(item) {
+  if (deletingKnowledgeBaseIds.value[item.id]) {
+    return;
+  }
+  const confirmed = window.confirm(
+    `确认删除知识库「${item.name}」吗？这会同时删除其中的文档、本地文件和向量索引。`,
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  deletingKnowledgeBaseIds.value = {
+    ...deletingKnowledgeBaseIds.value,
+    [item.id]: true,
+  };
+  errorMessage.value = "";
+
+  try {
+    await deleteKnowledgeBase(item.id);
+    if (editingKnowledgeBaseId.value === item.id) {
+      resetKnowledgeBaseForm();
+    }
+
+    const nextTotal = Math.max(0, knowledgeBaseTotal.value - 1);
+    const nextTotalPages = Math.max(
+      1,
+      Math.ceil(nextTotal / knowledgeBasePageSize.value),
+    );
+    const nextPage = Math.min(knowledgeBasePage.value, nextTotalPages);
+    await Promise.all([loadKnowledgeBases(nextPage), refreshKnowledgeBaseReferences()]);
+  } catch (error) {
+    errorMessage.value = error.message;
+  } finally {
+    deletingKnowledgeBaseIds.value = {
+      ...deletingKnowledgeBaseIds.value,
+      [item.id]: false,
+    };
   }
 }
 
@@ -916,13 +1007,13 @@ onMounted(async () => {
         <div class="knowledge-workspace">
           <section class="knowledge-panel knowledge-editor">
             <div class="panel-header">
-              <span>知识库工坊</span>
-              <span>{{ knowledgeBaseTotal }} 个</span>
+              <span>{{ knowledgeBaseFormHeading }}</span>
+              <span>{{ isEditingKnowledgeBase ? "配置锁定" : `${knowledgeBaseTotal} 个` }}</span>
             </div>
 
             <div v-if="errorMessage" class="error-banner">{{ errorMessage }}</div>
 
-            <form class="knowledge-form" @submit.prevent="handleCreateKnowledgeBase">
+            <form class="knowledge-form" @submit.prevent="handleSubmitKnowledgeBaseForm">
               <label class="field-label">
                 <span>知识库名称</span>
                 <input
@@ -943,7 +1034,7 @@ onMounted(async () => {
                 />
               </label>
 
-              <div class="field-grid">
+              <div v-if="!isEditingKnowledgeBase" class="field-grid">
                 <label class="field-label">
                   <span>Embedding 模型</span>
                   <input
@@ -983,9 +1074,24 @@ onMounted(async () => {
                 </label>
               </div>
 
-              <button class="secondary-button" :disabled="creatingKnowledgeBase" type="submit">
-                {{ creatingKnowledgeBase ? "创建中..." : "创建知识库" }}
-              </button>
+              <p v-else class="knowledge-form-note">
+                配置项创建后不可修改，避免已有文档向量和切分策略不一致。
+              </p>
+
+              <div class="knowledge-form-actions">
+                <button class="secondary-button" :disabled="creatingKnowledgeBase" type="submit">
+                  {{ knowledgeBaseFormSubmitLabel }}
+                </button>
+                <button
+                  v-if="isEditingKnowledgeBase"
+                  class="ghost-button"
+                  :disabled="creatingKnowledgeBase"
+                  type="button"
+                  @click="cancelEditKnowledgeBase"
+                >
+                  取消编辑
+                </button>
+              </div>
             </form>
           </section>
 
@@ -1002,8 +1108,22 @@ onMounted(async () => {
 
               <article v-for="item in knowledgeBases" :key="item.id" class="knowledge-card">
                 <div class="knowledge-card-header">
-                  <strong>{{ item.name }}</strong>
-                  <span>{{ item.document_count }} 份文档</span>
+                  <div class="knowledge-card-title">
+                    <strong>{{ item.name }}</strong>
+                    <span>{{ item.document_count }} 份文档</span>
+                  </div>
+                  <div class="knowledge-card-actions">
+                    <button class="ghost-button" @click="startEditKnowledgeBase(item)">
+                      编辑
+                    </button>
+                    <button
+                      class="ghost-button danger"
+                      :disabled="deletingKnowledgeBaseIds[item.id]"
+                      @click="handleDeleteKnowledgeBase(item)"
+                    >
+                      {{ deletingKnowledgeBaseIds[item.id] ? "删除中..." : "删除" }}
+                    </button>
+                  </div>
                 </div>
                 <p>{{ item.description || "暂无描述" }}</p>
                 <div class="knowledge-meta">

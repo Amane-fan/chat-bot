@@ -16,7 +16,7 @@
 - 检索增强问答：用户提问时自动检索当前会话绑定知识库，将命中的文档片段注入系统提示词。
 - 来源片段展示：模型回答下方可展开查看本次命中的知识库片段。
 - 来源快照持久化：命中的来源片段随 assistant 消息保存，刷新页面后仍可查看。
-- 知识库管理：支持创建知识库、分页浏览、上传文档、删除文档。
+- 知识库管理：支持创建、编辑、删除知识库，分页浏览，上传文档和删除文档。
 - 文档向量化：支持 `TXT / MD / PDF` 文档上传，按知识库配置切分并写入 Qdrant。
 - 降级处理：知识库无命中、空知识库或检索异常时，不阻断普通聊天。
 
@@ -245,6 +245,8 @@ npm run dev
 | `GET` | `/api/knowledge-bases` | 分页获取知识库 |
 | `GET` | `/api/knowledge-bases/options` | 获取会话选择器选项 |
 | `POST` | `/api/knowledge-bases` | 创建知识库 |
+| `PATCH` | `/api/knowledge-bases/{knowledge_base_id}` | 编辑知识库名称和描述 |
+| `DELETE` | `/api/knowledge-bases/{knowledge_base_id}` | 删除知识库及其文档和向量索引 |
 | `GET` | `/api/knowledge-bases/{knowledge_base_id}/documents` | 获取知识库文档列表 |
 | `POST` | `/api/knowledge-bases/{knowledge_base_id}/documents` | 上传文档 |
 | `DELETE` | `/api/knowledge-bases/{knowledge_base_id}/documents/{document_id}` | 删除文档 |

@@ -105,6 +105,13 @@ class KnowledgeBaseCreateRequest(BaseModel):
     config: KnowledgeBaseConfig
 
 
+class KnowledgeBaseUpdateRequest(BaseModel):
+    """编辑知识库时只允许修改基础信息。"""
+
+    name: str
+    description: str | None = None
+
+
 class KnowledgeBaseSummary(BaseModel):
     """知识库摘要信息。"""
 
