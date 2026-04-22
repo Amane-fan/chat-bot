@@ -54,7 +54,7 @@ RERANK_BASE_URL = os.getenv(
     "RERANK_BASE_URL",
     "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
 )
-RERANK_CANDIDATE_TOP_K = _get_int_env("RERANK_CANDIDATE_TOP_K", 20)
+RERANK_CANDIDATE_TOP_K = _get_int_env("RERANK_CANDIDATE_TOP_K", 10)
 RERANK_TOP_N = _get_int_env("RERANK_TOP_N", 5)
 RERANK_TIMEOUT_SECONDS = _get_float_env("RERANK_TIMEOUT_SECONDS", 15)
 RERANK_SCORE_THRESHOLD = _get_optional_float_env("RERANK_SCORE_THRESHOLD")
