@@ -13,7 +13,7 @@
   --shadow-soft: 0 22px 46px rgba(63, 65, 57, 0.11);
   --shadow-float: 0 18px 32px rgba(83, 71, 58, 0.12);
   font-family: "Palatino Linotype", "Book Antiqua", "Songti SC", "STSong", serif;
-  font-weight: 550;
+  font-weight: 650;
   color: var(--ink);
   background: var(--bg);
 }
@@ -107,13 +107,13 @@ button {
 .stage-header h2 {
   margin: 0;
   font-family: "Baskerville", "Times New Roman", "Songti SC", serif;
-  font-weight: 600;
   letter-spacing: 0.01em;
 }
 
 .brand h1 {
   max-width: 9ch;
   font-size: clamp(2.1rem, 4vw, 3rem);
+  font-weight: 600;
   line-height: 1.02;
   color: var(--accent-deep);
 }
@@ -122,6 +122,14 @@ button {
   font-size: clamp(1.55rem, 2.6vw, 2.45rem);
   line-height: 1.08;
   color: var(--accent);
+}
+
+.chat-stage .stage-header h2 {
+  font-weight: 600;
+}
+
+.knowledge-stage .stage-header h2 {
+  font-weight: 720;
 }
 
 .brand-copy,
@@ -137,13 +145,14 @@ button {
 .sidebar-card span,
 .view-button small {
   color: var(--ink-soft);
+  font-weight: 650;
 }
 
 .hint,
 .panel-header,
 .knowledge-list-header span,
 .pager span {
-  font-weight: 600;
+  font-weight: 700;
 }
 
 .brand-copy {
@@ -151,6 +160,7 @@ button {
   margin: 14px 0 0;
   line-height: 1.85;
   color: rgba(74, 80, 74, 0.88);
+  font-weight: 650;
 }
 
 .eyebrow {
@@ -245,6 +255,7 @@ button {
   margin: 0;
   line-height: 1.7;
   color: rgba(74, 80, 74, 0.84);
+  font-weight: 650;
 }
 
 .workspace {
@@ -440,6 +451,7 @@ button {
   color: #fffaf7;
   background: linear-gradient(135deg, var(--accent), var(--accent-deep));
   box-shadow: 0 10px 22px rgba(191, 114, 101, 0.25);
+  font-weight: 700;
 }
 
 .secondary-button {
@@ -448,7 +460,7 @@ button {
   color: var(--accent-deep);
   background: linear-gradient(135deg, #f4e4d5, #fbf7f0);
   border: 1px solid rgba(210, 177, 154, 0.35);
-  font-weight: 650;
+  font-weight: 700;
 }
 
 .pager-button {
@@ -456,6 +468,7 @@ button {
   color: var(--ink);
   background: rgba(255, 255, 255, 0.55);
   border: 1px solid rgba(158, 170, 156, 0.24);
+  font-weight: 650;
 }
 
 .panel-toggle {
@@ -563,7 +576,7 @@ button {
   color: rgba(83, 91, 83, 0.82);
   background: transparent;
   font-size: 0.82rem;
-  font-weight: 650;
+  font-weight: 700;
 }
 
 .ghost-button:disabled {
@@ -582,7 +595,7 @@ button {
   border: 1px solid var(--frame);
   outline: none;
   color: rgba(45, 51, 45, 0.92);
-  font-weight: 560;
+  font-weight: 650;
   transition: border-color 180ms ease, box-shadow 180ms ease, background 180ms ease;
 }
 
@@ -629,7 +642,7 @@ button {
   background: rgba(255, 253, 249, 0.72);
   border: 1px dashed rgba(152, 165, 152, 0.26);
   font-size: 0.82rem;
-  font-weight: 600;
+  font-weight: 650;
   line-height: 1.6;
 }
 
@@ -693,7 +706,7 @@ button {
   z-index: 1;
   margin: 0;
   color: rgba(55, 63, 57, 0.9);
-  font-weight: 560;
+  font-weight: 650;
   line-height: 1.7;
 }
 
@@ -748,7 +761,7 @@ button {
 .knowledge-document-meta {
   color: rgba(67, 76, 68, 0.88);
   font-size: 0.8rem;
-  font-weight: 600;
+  font-weight: 650;
 }
 
 .knowledge-document-list {
@@ -847,6 +860,7 @@ button {
   border: 1px solid rgba(214, 136, 124, 0.26);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
   font-size: 0.82rem;
+  font-weight: 650;
 }
 
 .session-modal-copy,
@@ -854,6 +868,7 @@ button {
   margin: 0;
   line-height: 1.7;
   color: rgba(84, 91, 83, 0.82);
+  font-weight: 650;
 }
 
 .modal-scrim {
@@ -886,6 +901,7 @@ button {
   margin: 0;
   font-family: "Baskerville", "Times New Roman", "Songti SC", serif;
   font-size: clamp(1.8rem, 3vw, 2.4rem);
+  font-weight: 720;
   color: var(--accent-deep);
 }
 
@@ -1073,7 +1089,7 @@ button {
 .message-card p {
   margin: 0;
   line-height: 1.82;
-  font-weight: 620;
+  font-weight: 680;
   white-space: pre-wrap;
 }
 
@@ -1126,6 +1142,7 @@ button {
   gap: 10px;
   color: rgba(45, 58, 43, 0.86);
   font-size: 0.82rem;
+  font-weight: 650;
 }
 
 .message-retrieval-source strong {
@@ -1137,13 +1154,14 @@ button {
 .message-retrieval-meta {
   color: rgba(80, 92, 78, 0.72);
   font-size: 0.76rem;
+  font-weight: 650;
 }
 
 .message-retrieval-item p {
   margin-top: 5px;
   color: rgba(43, 49, 42, 0.82);
   font-size: 0.82rem;
-  font-weight: 520;
+  font-weight: 650;
   line-height: 1.6;
 }
 
@@ -1155,6 +1173,7 @@ button {
   padding: 24px;
   color: var(--ink-soft);
   text-align: center;
+  font-weight: 650;
   line-height: 1.8;
 }
 
@@ -1186,6 +1205,7 @@ button {
   color: #9f5347;
   background: rgba(214, 136, 124, 0.12);
   border: 1px solid rgba(214, 136, 124, 0.18);
+  font-weight: 700;
 }
 
 @keyframes rise {
