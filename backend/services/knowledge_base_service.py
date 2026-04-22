@@ -28,7 +28,7 @@ from backend.schemas import (
     KnowledgeBaseUpdateRequest,
 )
 
-DEFAULT_EMBEDDING_MODEL = "text-embedding-v1"
+DEFAULT_EMBEDDING_MODEL = "text-embedding-v4"
 DEFAULT_CHUNK_SIZE = 500
 DEFAULT_CHUNK_OVERLAP = 50
 DEFAULT_RETRIEVAL_TOP_K = 5

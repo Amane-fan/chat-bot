@@ -1,4 +1,5 @@
 import json
+import logging
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -31,6 +32,15 @@ KNOWLEDGE_SYSTEM_INSTRUCTION = (
     "请明确说明无法从知识库确认，并基于通用知识谨慎回答。"
     "回答中引用知识库内容时，请使用 [来源 1] 这样的来源编号。"
 )
+QUESTION_REWRITE_SYSTEM_PROMPT = (
+    "你负责把用户当前问题改写成一个独立、明确、适合检索和回答的问题。"
+    "请结合已有对话历史补全指代、省略和上下文，但不要引入历史中不存在的信息。"
+    "如果当前问题已经足够独立，请原样或近似原样返回。"
+    "只输出改写后的问题，不要解释、不要添加前缀。"
+)
+logger = logging.getLogger("uvicorn.error")
+logger.setLevel(logging.INFO)
+
 
 def utc_now() -> datetime:
     """MySQL DATETIME 不带时区，这里统一存 UTC naive datetime。"""
@@ -51,6 +61,7 @@ class ChatService:
 
     def __init__(self, knowledge_base_service: KnowledgeBaseService | None = None) -> None:
         self.chain = None
+        self.rewrite_chain = None
         self.knowledge_base_service = knowledge_base_service
 
     def startup(self) -> None:
@@ -83,12 +94,20 @@ class ChatService:
                 ("human", "{question}"),
             ]
         )
+        rewrite_prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", QUESTION_REWRITE_SYSTEM_PROMPT),
+                MessagesPlaceholder("history", optional=True),
+                ("human", "当前用户问题：{question}\n\n请输出改写后的问题："),
+            ]
+        )
         model = ChatOpenAI(
             model=config.DASHSCOPE_DEFAULT_MODEL,
             api_key=config.DASHSCOPE_API_KEY,
             base_url=config.DASHSCOPE_BASE_URL,
         )
         self.chain = prompt | model | StrOutputParser()
+        self.rewrite_chain = rewrite_prompt | model | StrOutputParser()
 
     def list_sessions(self) -> list[SessionSummary]:
         """按最近活跃时间返回会话列表。"""
@@ -205,22 +224,13 @@ class ChatService:
             raise HTTPException(status_code=400, detail="消息内容不能为空")
 
         session_factory = get_session_factory()
-        with session_factory() as session:
-            self._get_session_or_404(session, session_id)
-            history = self._load_history(session, session_id)
-            knowledge_bases = self._list_knowledge_bases_for_sessions(
-                session, [session_id]
-            ).get(session_id, [])
-
-        retrieved_chunks = self._retrieve_knowledge_chunks(
-            normalized_content, knowledge_bases
+        prepared_request = self._prepare_chat_request(
+            session_id=session_id,
+            original_question=normalized_content,
+            request_mode="sync",
         )
-        system_prompt = self._build_system_prompt(retrieved_chunks)
-        llm_payload = {
-            "system_prompt": system_prompt,
-            "question": normalized_content,
-            "history": history,
-        }
+        retrieved_chunks = prepared_request["retrieved_chunks"]
+        llm_payload = prepared_request["llm_payload"]
 
         try:
             answer = self._get_chain().invoke(llm_payload)
@@ -274,22 +284,13 @@ class ChatService:
             raise HTTPException(status_code=400, detail="消息内容不能为空")
 
         session_factory = get_session_factory()
-        with session_factory() as session:
-            self._get_session_or_404(session, session_id)
-            history = self._load_history(session, session_id)
-            knowledge_bases = self._list_knowledge_bases_for_sessions(
-                session, [session_id]
-            ).get(session_id, [])
-
-        retrieved_chunks = self._retrieve_knowledge_chunks(
-            normalized_content, knowledge_bases
+        prepared_request = self._prepare_chat_request(
+            session_id=session_id,
+            original_question=normalized_content,
+            request_mode="stream",
         )
-        system_prompt = self._build_system_prompt(retrieved_chunks)
-        llm_payload = {
-            "system_prompt": system_prompt,
-            "question": normalized_content,
-            "history": history,
-        }
+        retrieved_chunks = prepared_request["retrieved_chunks"]
+        llm_payload = prepared_request["llm_payload"]
 
         user_message_created_at = utc_now()
         assistant_message_created_at = utc_now()
@@ -388,6 +389,103 @@ class ChatService:
             raise RuntimeError("模型链尚未初始化")
         return self.chain
 
+    def _get_rewrite_chain(self):
+        if self.rewrite_chain is None:
+            raise RuntimeError("问题重写链尚未初始化")
+        return self.rewrite_chain
+
+    def _prepare_chat_request(
+        self,
+        *,
+        session_id: str,
+        original_question: str,
+        request_mode: str,
+    ) -> dict[str, Any]:
+        request_id = uuid.uuid4().hex
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            self._get_session_or_404(session, session_id)
+            history = self._load_history(session, session_id)
+            knowledge_bases = self._list_knowledge_bases_for_sessions(
+                session, [session_id]
+            ).get(session_id, [])
+
+        rewritten_question, rewrite_fallback_reason = self._rewrite_question(
+            request_id=request_id,
+            session_id=session_id,
+            original_question=original_question,
+            history=history,
+        )
+        retrieved_chunks = self._retrieve_knowledge_chunks(
+            rewritten_question, knowledge_bases
+        )
+        system_prompt = self._build_system_prompt(retrieved_chunks)
+        llm_payload = {
+            "system_prompt": system_prompt,
+            "question": rewritten_question,
+            "history": history,
+        }
+        self._log_chat_request(
+            request_id=request_id,
+            request_mode=request_mode,
+            session_id=session_id,
+            original_question=original_question,
+            rewritten_question=rewritten_question,
+            rewrite_fallback_reason=rewrite_fallback_reason,
+            history=history,
+            system_prompt=system_prompt,
+            llm_payload=llm_payload,
+            knowledge_bases=knowledge_bases,
+            retrieved_chunks=retrieved_chunks,
+        )
+        return {
+            "request_id": request_id,
+            "history": history,
+            "knowledge_bases": knowledge_bases,
+            "retrieved_chunks": retrieved_chunks,
+            "llm_payload": llm_payload,
+            "rewritten_question": rewritten_question,
+            "rewrite_fallback_reason": rewrite_fallback_reason,
+        }
+
+    def _rewrite_question(
+        self,
+        *,
+        request_id: str,
+        session_id: str,
+        original_question: str,
+        history: list[dict[str, str]],
+    ) -> tuple[str, str | None]:
+        rewrite_payload = {
+            "question": original_question,
+            "history": history,
+        }
+        try:
+            rewritten_question = str(
+                self._get_rewrite_chain().invoke(rewrite_payload)
+            ).strip()
+            if not rewritten_question:
+                raise ValueError("rewrite chain returned empty question")
+            return rewritten_question, None
+        except Exception as exc:
+            fallback_reason = type(exc).__name__
+            logger.warning(
+                "Question rewrite failed; falling back to original question: %s",
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "session_id": session_id,
+                        "error_type": fallback_reason,
+                        "error_message": str(exc),
+                        "fallback_question": original_question,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+            )
+            return original_question, fallback_reason
+
     def _ensure_chat_message_columns(self, inspector) -> None:
         column_names = {
             column["name"] for column in inspector.get_columns("chat_messages")
@@ -420,6 +518,68 @@ class ChatService:
         except Exception:
             # 知识库检索失败不影响基础聊天，避免一次 Qdrant/Embedding 波动阻断问答。
             return []
+
+    def _log_chat_request(
+        self,
+        *,
+        request_id: str,
+        request_mode: str,
+        session_id: str,
+        original_question: str,
+        rewritten_question: str,
+        rewrite_fallback_reason: str | None,
+        history: list[dict[str, str]],
+        system_prompt: str,
+        llm_payload: dict[str, Any],
+        knowledge_bases: list[KnowledgeBaseReference],
+        retrieved_chunks: list[dict[str, Any]],
+    ) -> None:
+        question_was_rewritten = rewritten_question != original_question
+        log_payload = {
+            "request_id": request_id,
+            "request_mode": request_mode,
+            "session_id": session_id,
+            "model": config.DASHSCOPE_DEFAULT_MODEL,
+            "original_question": original_question,
+            "rewritten_question": rewritten_question,
+            "question_was_rewritten": question_was_rewritten,
+            "rewrite_status": "fallback" if rewrite_fallback_reason else "success",
+            "rewrite_fallback_reason": rewrite_fallback_reason,
+            "rewrite_payload": {
+                "question": original_question,
+                "history": history,
+            },
+            "history": history,
+            "system_prompt": system_prompt,
+            "llm_payload": llm_payload,
+            "knowledge_bases": [
+                knowledge_base.model_dump() for knowledge_base in knowledge_bases
+            ],
+            "retrieved_chunk_count": len(retrieved_chunks),
+            "retrieved_sources": self._build_retrieved_source_log_items(
+                retrieved_chunks
+            ),
+        }
+        logger.info(
+            "Chat request payload: %s",
+            json.dumps(log_payload, ensure_ascii=False, indent=2, default=str),
+        )
+
+    def _build_retrieved_source_log_items(
+        self, retrieved_chunks: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "knowledge_base_id": chunk.get("knowledge_base_id"),
+                "knowledge_base_name": chunk.get("knowledge_base_name"),
+                "document_id": chunk.get("document_id"),
+                "original_filename": chunk.get("original_filename"),
+                "chunk_index": chunk.get("chunk_index"),
+                "score": chunk.get("score"),
+                "text_length": len(str(chunk.get("text") or "")),
+            }
+            for chunk in retrieved_chunks
+        ]
 
     def _build_system_prompt(self, retrieved_chunks: list[dict[str, Any]]) -> str:
         if not retrieved_chunks:
