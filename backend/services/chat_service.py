@@ -535,6 +535,11 @@ class ChatService:
         retrieved_chunks: list[dict[str, Any]],
     ) -> None:
         question_was_rewritten = rewritten_question != original_question
+        log_history = self._mask_ai_outputs_in_history(history)
+        log_llm_payload = {
+            **llm_payload,
+            "history": log_history,
+        }
         log_payload = {
             "request_id": request_id,
             "request_mode": request_mode,
@@ -547,11 +552,11 @@ class ChatService:
             "rewrite_fallback_reason": rewrite_fallback_reason,
             "rewrite_payload": {
                 "question": original_question,
-                "history": history,
+                "history": log_history,
             },
-            "history": history,
+            "history": log_history,
             "system_prompt": system_prompt,
-            "llm_payload": llm_payload,
+            "llm_payload": log_llm_payload,
             "knowledge_bases": [
                 knowledge_base.model_dump() for knowledge_base in knowledge_bases
             ],
@@ -564,6 +569,21 @@ class ChatService:
             "Chat request payload: %s",
             json.dumps(log_payload, ensure_ascii=False, indent=2, default=str),
         )
+
+    def _mask_ai_outputs_in_history(
+        self, history: list[dict[str, str]]
+    ) -> list[dict[str, str]]:
+        return [
+            {
+                **message,
+                "content": (
+                    "..."
+                    if message.get("role") == "assistant"
+                    else message.get("content", "")
+                ),
+            }
+            for message in history
+        ]
 
     def _build_retrieved_source_log_items(
         self, retrieved_chunks: list[dict[str, Any]]
