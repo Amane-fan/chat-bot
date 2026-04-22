@@ -26,7 +26,7 @@ from backend.schemas import (
 from backend.services.knowledge_base_service import KnowledgeBaseService
 
 
-BASE_SYSTEM_PROMPT = "你是一个智能助手，热情耐心地回答用户的问题。"
+BASE_SYSTEM_PROMPT = "你是一个智能助手，客观，简要，精确地回答用户的问题。"
 KNOWLEDGE_SYSTEM_INSTRUCTION = (
     "仅在相关时参考以下知识库内容；如果知识库资料不足或没有覆盖问题，"
     "请明确说明无法从知识库确认，并基于通用知识谨慎回答。"

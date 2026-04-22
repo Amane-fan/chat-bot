@@ -18,6 +18,7 @@
 - 来源快照持久化：命中的来源片段随 assistant 消息保存，刷新页面后仍可查看。
 - 知识库管理：支持创建、编辑、删除知识库，分页浏览，上传文档和删除文档。
 - 文档向量化：支持 `TXT / MD / PDF` 文档上传，按知识库配置切分并写入 Qdrant。
+- 二阶段精排：可选调用阿里百炼 `qwen3-vl-rerank` 对向量召回片段重新排序，提高 RAG 上下文相关性。
 - 降级处理：知识库无命中、空知识库或检索异常时，不阻断普通聊天。
 
 ## 技术栈
@@ -28,6 +29,7 @@
 | 后端 | FastAPI, Pydantic, SQLAlchemy |
 | LLM 编排 | LangChain |
 | 聊天模型 | `langchain_openai.ChatOpenAI`，默认接入阿里百炼兼容接口 |
+| Rerank | 阿里百炼 `qwen3-vl-rerank`，默认关闭，可通过环境变量启用 |
 | 结构化存储 | MySQL |
 | 向量数据库 | Qdrant |
 | 文档解析 | pypdf, 文本解析 |
@@ -137,6 +139,14 @@ DASHSCOPE_API_KEY=your_dashscope_api_key
 DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 DASHSCOPE_DEFAULT_MODEL=qwen-plus
 EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+RERANK_ENABLED=false
+RERANK_MODEL=qwen3-vl-rerank
+RERANK_BASE_URL=https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
+RERANK_CANDIDATE_TOP_K=20
+RERANK_TOP_N=5
+RERANK_TIMEOUT_SECONDS=15
+RERANK_SCORE_THRESHOLD=
+RERANK_INSTRUCT=Given a web search query, retrieve relevant passages that answer the query.
 
 MYSQL_HOST=127.0.0.1
 MYSQL_PORT=3306

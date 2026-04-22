@@ -7,6 +7,8 @@ import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from fastapi import HTTPException, UploadFile
 from langchain_openai import OpenAIEmbeddings
@@ -44,6 +46,8 @@ logger.setLevel(logging.INFO)
 
 
 def utc_now():
+    """返回适合写入 MySQL DATETIME 的当前 UTC 时间。"""
+
     from datetime import datetime, timezone
 
     # MySQL DATETIME 不带时区，这里统一转成 UTC 的 naive datetime 存储。
@@ -51,6 +55,8 @@ def utc_now():
 
 
 def to_iso_string(value):
+    """把数据库时间转换成带 UTC 时区标记的 ISO 字符串。"""
+
     from datetime import timezone
 
     # 对外响应统一补回 UTC 时区，前端展示时就能按标准 ISO 处理。
@@ -69,15 +75,21 @@ class RecursiveCharacterTextSplitter:
         chunk_overlap: int,
         separators: list[str],
     ) -> None:
+        """保存切分窗口、重叠长度和分隔符优先级。"""
+
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.separators = separators
 
     def split_text(self, text: str) -> list[str]:
+        """按递归分隔策略切分文本，并在相邻块之间补重叠上下文。"""
+
         chunks = self._split_recursive(text, self.separators)
         return self._apply_overlap(chunks)
 
     def _split_recursive(self, text: str, separators: list[str]) -> list[str]:
+        """按分隔符优先级递归切分，尽量保留自然段落边界。"""
+
         text = text.strip()
         if not text:
             return []
@@ -117,6 +129,8 @@ class RecursiveCharacterTextSplitter:
         return chunks
 
     def _split_fixed(self, text: str) -> list[str]:
+        """当没有可用分隔符时，按固定窗口强制切分文本。"""
+
         step = max(1, self.chunk_size - self.chunk_overlap)
         return [
             text[index : index + self.chunk_size].strip()
@@ -125,6 +139,8 @@ class RecursiveCharacterTextSplitter:
         ]
 
     def _apply_overlap(self, chunks: list[str]) -> list[str]:
+        """为切分后的块补充前一块尾部文本，减少边界信息丢失。"""
+
         if not chunks or self.chunk_overlap <= 0:
             return chunks
 
@@ -138,10 +154,14 @@ class RecursiveCharacterTextSplitter:
 
 class KnowledgeBaseService:
     def __init__(self) -> None:
+        """初始化知识库服务运行时依赖和本地文档存储目录。"""
+
         self.qdrant_client: Any | None = None
         self.storage_root = Path(config.DOCUMENT_STORAGE_ROOT).resolve()
 
     def startup(self) -> None:
+        """启动知识库服务，校验依赖并初始化本地存储和 Qdrant 客户端。"""
+
         # 启动阶段提前暴露配置或建表问题，避免请求进来后才报错。
         self._validate_settings()
         init_mysql()
@@ -177,6 +197,8 @@ class KnowledgeBaseService:
     def create_knowledge_base(
         self, payload: KnowledgeBaseCreateRequest
     ) -> KnowledgeBaseSummary:
+        """创建知识库元数据，并保存创建时确定的切分和向量化配置。"""
+
         name = self._normalize_name(payload.name)
         description = self._normalize_description(payload.description)
         # 去掉 None，避免把未填写项也存成显式 null。
@@ -245,6 +267,8 @@ class KnowledgeBaseService:
             session.commit()
 
     def list_knowledge_bases(self, page: int, page_size: int) -> KnowledgeBaseListResponse:
+        """分页查询知识库列表，返回前端列表页需要的摘要信息。"""
+
         if page < 1 or page_size < 1:
             raise HTTPException(status_code=400, detail="分页参数必须大于 0")
         if page_size > 100:
@@ -270,6 +294,8 @@ class KnowledgeBaseService:
         )
 
     def list_knowledge_base_options(self) -> list[KnowledgeBaseReference]:
+        """返回会话绑定知识库时使用的轻量选项列表。"""
+
         session_factory = get_session_factory()
         with session_factory() as session:
             items = session.scalars(
@@ -280,6 +306,8 @@ class KnowledgeBaseService:
     def list_knowledge_base_documents(
         self, knowledge_base_id: str
     ) -> KnowledgeBaseDocumentListResponse:
+        """查询单个知识库下的文档及其处理状态。"""
+
         session_factory = get_session_factory()
         with session_factory() as session:
             self._get_knowledge_base_or_404(session, knowledge_base_id)
@@ -333,10 +361,16 @@ class KnowledgeBaseService:
         ready_document_id_map: dict[str, list[str]] = {}
         for knowledge_base_id, document_id in ready_document_rows:
             ready_document_id_map.setdefault(knowledge_base_id, []).append(document_id)
-        retrieved_chunks: list[dict[str, Any]] = []
-        used_chars = 0
+        candidate_chunks: list[dict[str, Any]] = []
         retrieval_log_items: list[dict[str, Any]] = []
         started_at = time.perf_counter()
+        rerank_enabled = config.RERANK_ENABLED
+        query_top_k = top_k
+        if rerank_enabled:
+            query_top_k = max(
+                top_k,
+                self._normalize_positive_int(config.RERANK_CANDIDATE_TOP_K, top_k),
+            )
 
         for knowledge_base_ref in knowledge_bases:
             knowledge_base = knowledge_base_map.get(knowledge_base_ref.id)
@@ -372,7 +406,7 @@ class KnowledgeBaseService:
                 hits = self._query_knowledge_base_chunks(
                     knowledge_base.id,
                     query_vector,
-                    top_k,
+                    query_top_k,
                     effective_score_threshold,
                     ready_document_ids,
                 )
@@ -395,47 +429,30 @@ class KnowledgeBaseService:
                 )
             )
 
-            for hit in hits:
-                payload = hit.payload or {}
-                text = str(payload.get("text") or "").strip()
-                if not text:
-                    continue
+            candidate_chunks.extend(
+                self._build_candidate_chunks(knowledge_base, knowledge_base_ref, hits)
+            )
 
-                remaining_chars = context_char_limit - used_chars
-                if remaining_chars <= 0:
-                    self._log_retrieval_result(
-                        normalized_question, retrieval_log_items, started_at, retrieved_chunks
-                    )
-                    return retrieved_chunks
-
-                truncated_text = text[:remaining_chars]
-                used_chars += len(truncated_text)
-                retrieved_chunks.append(
-                    {
-                        "knowledge_base_id": knowledge_base.id,
-                        "knowledge_base_name": knowledge_base_ref.name,
-                        "document_id": payload.get("document_id"),
-                        "original_filename": payload.get("original_filename"),
-                        "chunk_index": payload.get("chunk_index"),
-                        "score": getattr(hit, "score", None),
-                        "text": truncated_text,
-                    }
-                )
-
-                if used_chars >= context_char_limit:
-                    self._log_retrieval_result(
-                        normalized_question, retrieval_log_items, started_at, retrieved_chunks
-                    )
-                    return retrieved_chunks
-
+        selected_candidates, rerank_log = self._select_retrieval_candidates(
+            normalized_question, candidate_chunks, top_k
+        )
+        retrieved_chunks = self._candidates_to_retrieved_chunks(
+            selected_candidates, context_char_limit
+        )
         self._log_retrieval_result(
-            normalized_question, retrieval_log_items, started_at, retrieved_chunks
+            normalized_question,
+            retrieval_log_items,
+            started_at,
+            retrieved_chunks,
+            rerank_log=rerank_log,
         )
         return retrieved_chunks
 
     def upload_knowledge_base_document(
         self, knowledge_base_id: str, file: UploadFile
     ) -> KnowledgeBaseDocumentUploadResponse:
+        """上传文档并完成解析、切分、向量化和 Qdrant 入库。"""
+
         original_filename = self._normalize_upload_filename(file.filename)
         self._validate_document_extension(original_filename)
         file_bytes = file.file.read()
@@ -581,6 +598,8 @@ class KnowledgeBaseService:
             )
 
     def _validate_settings(self) -> None:
+        """校验知识库能力启动所需的数据库、模型和向量库配置。"""
+
         missing = []
         if not config.MYSQL_HOST:
             missing.append("MYSQL_HOST")
@@ -600,6 +619,8 @@ class KnowledgeBaseService:
             raise RuntimeError(f"缺少必要环境变量: {', '.join(missing)}")
 
     def _normalize_name(self, name: str) -> str:
+        """标准化知识库名称，并执行非空和长度校验。"""
+
         # 把连续空白压成一个空格，避免“看起来一样”的名称实际不同。
         normalized = " ".join(name.split())
         if not normalized:
@@ -609,6 +630,8 @@ class KnowledgeBaseService:
         return normalized
 
     def _normalize_description(self, description: str | None) -> str | None:
+        """标准化知识库描述，空字符串统一转换为 None。"""
+
         if description is None:
             return None
         normalized = description.strip()
@@ -618,6 +641,8 @@ class KnowledgeBaseService:
         return normalized
 
     def _normalize_upload_filename(self, filename: str | None) -> str:
+        """提取并校验上传文件名，避免目录穿越和空文件名。"""
+
         normalized = Path(filename or "").name.strip()
         if not normalized:
             raise HTTPException(status_code=400, detail="文件名不能为空")
@@ -626,27 +651,37 @@ class KnowledgeBaseService:
         return normalized
 
     def _validate_document_extension(self, filename: str) -> None:
+        """限制可入库文档类型，只允许当前解析链路支持的扩展名。"""
+
         if Path(filename).suffix.lower() not in ALLOWED_DOCUMENT_EXTENSIONS:
             raise HTTPException(status_code=400, detail="仅支持上传 TXT、MD、PDF 文件")
 
     def _build_stored_filename(self, document_id: str, original_filename: str) -> str:
+        """生成带文档 ID 前缀的安全落盘文件名。"""
+
         sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", original_filename).strip("._")
         if not sanitized:
             sanitized = f"document{Path(original_filename).suffix.lower()}"
         return f"{document_id}_{sanitized}"
 
     def _build_document_path(self, knowledge_base_id: str, stored_filename: str) -> Path:
+        """生成文档在本地存储目录中的完整路径。"""
+
         return self.storage_root / knowledge_base_id / stored_filename
 
     def _save_document_bytes(
         self, knowledge_base_id: str, stored_filename: str, file_bytes: bytes
     ) -> None:
+        """把上传文件内容写入知识库对应的本地目录。"""
+
         document_dir = self.storage_root / knowledge_base_id
         document_dir.mkdir(parents=True, exist_ok=True)
         document_path = document_dir / stored_filename
         document_path.write_bytes(file_bytes)
 
     def _extract_document_text(self, filename: str, file_bytes: bytes) -> str:
+        """按文件类型抽取可切分和向量化的纯文本内容。"""
+
         suffix = Path(filename).suffix.lower()
         if suffix in {".txt", ".md"}:
             try:
@@ -672,6 +707,8 @@ class KnowledgeBaseService:
         return text
 
     def _split_document_text(self, knowledge_base_config: dict[str, Any], text: str) -> list[str]:
+        """按知识库配置切分文档文本，返回可入向量库的文本块。"""
+
         chunk_size = int(knowledge_base_config.get("chunk_size") or DEFAULT_CHUNK_SIZE)
         chunk_overlap = int(
             knowledge_base_config.get("chunk_overlap") or DEFAULT_CHUNK_OVERLAP
@@ -702,6 +739,8 @@ class KnowledgeBaseService:
         return chunks
 
     def _decode_separator(self, separator: Any) -> str | None:
+        """把前端传入的转义分隔符还原成真实字符。"""
+
         if not isinstance(separator, str) or not separator:
             return None
         try:
@@ -712,6 +751,8 @@ class KnowledgeBaseService:
     def _embed_document_chunks(
         self, knowledge_base_config: dict[str, Any], chunks: list[str]
     ) -> list[list[float]]:
+        """调用 embedding 模型把文档块批量转换为向量。"""
+
         embeddings = self._build_embeddings(knowledge_base_config)
         try:
             return embeddings.embed_documents(chunks)
@@ -721,10 +762,14 @@ class KnowledgeBaseService:
     def _embed_query(
         self, knowledge_base_config: dict[str, Any], question: str
     ) -> list[float]:
+        """使用知识库对应 embedding 配置生成查询向量。"""
+
         embeddings = self._build_embeddings(knowledge_base_config)
         return embeddings.embed_query(question)
 
     def _build_embeddings(self, knowledge_base_config: dict[str, Any]) -> OpenAIEmbeddings:
+        """构造兼容 OpenAI 协议的 embedding 客户端。"""
+
         embedding_model = (
             knowledge_base_config.get("embedding_model") or DEFAULT_EMBEDDING_MODEL
         )
@@ -737,6 +782,8 @@ class KnowledgeBaseService:
         )
 
     def _ensure_collection(self, collection_name: str, vector_size: int) -> None:
+        """确保 Qdrant collection 存在，不存在时按向量维度创建。"""
+
         client = self._get_qdrant_client()
         _, qdrant_models = self._import_qdrant()
         if self._collection_exists(collection_name):
@@ -753,6 +800,8 @@ class KnowledgeBaseService:
             raise HTTPException(status_code=502, detail="创建 Qdrant collection 失败") from exc
 
     def _collection_exists(self, collection_name: str) -> bool:
+        """兼容不同 qdrant-client 版本检查 collection 是否存在。"""
+
         client = self._get_qdrant_client()
         try:
             if hasattr(client, "collection_exists"):
@@ -770,6 +819,8 @@ class KnowledgeBaseService:
         score_threshold: float | None,
         ready_document_ids: list[str],
     ) -> list[Any]:
+        """在指定知识库 collection 中按查询向量召回候选文本块。"""
+
         collection_name = self._collection_name(knowledge_base_id)
         if not self._collection_exists(collection_name):
             return []
@@ -795,9 +846,248 @@ class KnowledgeBaseService:
         )
         return list(response.points or [])
 
+    def _build_candidate_chunks(
+        self,
+        knowledge_base: KnowledgeBase,
+        knowledge_base_ref: KnowledgeBaseReference,
+        hits: list[Any],
+    ) -> list[dict[str, Any]]:
+        """把 Qdrant 命中结果转换成后续精排和上下文组装使用的候选结构。"""
+
+        candidates: list[dict[str, Any]] = []
+        for hit in hits:
+            payload = hit.payload or {}
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                continue
+            vector_score = getattr(hit, "score", None)
+            candidates.append(
+                {
+                    "knowledge_base_id": knowledge_base.id,
+                    "knowledge_base_name": knowledge_base_ref.name,
+                    "document_id": payload.get("document_id"),
+                    "original_filename": payload.get("original_filename"),
+                    "chunk_index": payload.get("chunk_index"),
+                    "score": vector_score,
+                    "vector_score": vector_score,
+                    "text": text,
+                }
+            )
+        return candidates
+
+    def _select_retrieval_candidates(
+        self, question: str, candidates: list[dict[str, Any]], top_k: int
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """根据 rerank 开关选择最终候选，并返回用于检索日志的精排状态。"""
+
+        rerank_log = {
+            "enabled": config.RERANK_ENABLED,
+            "status": "disabled",
+            "candidate_count": len(candidates),
+            "selected_count": len(candidates),
+        }
+        if not config.RERANK_ENABLED:
+            return candidates, rerank_log
+
+        rerank_top_n = self._normalize_positive_int(config.RERANK_TOP_N, top_k)
+        if not candidates:
+            return [], {
+                **rerank_log,
+                "status": "skipped_no_candidates",
+                "selected_count": 0,
+            }
+
+        started_at = time.perf_counter()
+        try:
+            selected_candidates = self._rerank_candidate_chunks(
+                question, candidates, rerank_top_n
+            )
+            rerank_log.update(
+                {
+                    "status": "succeeded",
+                    "selected_count": len(selected_candidates),
+                    "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                }
+            )
+            return selected_candidates, rerank_log
+        except Exception as exc:
+            fallback_candidates = self._limit_vector_candidates(candidates, top_k)
+            rerank_log.update(
+                {
+                    "status": "failed",
+                    "selected_count": len(fallback_candidates),
+                    "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                }
+            )
+            return fallback_candidates, rerank_log
+
+    def _rerank_candidate_chunks(
+        self, question: str, candidates: list[dict[str, Any]], top_n: int
+    ) -> list[dict[str, Any]]:
+        """调用百炼 rerank 对候选片段重新排序，并把精排分数写回候选。"""
+
+        request_top_n = min(top_n, len(candidates))
+        parameters: dict[str, Any] = {
+            "return_documents": False,
+            "top_n": request_top_n,
+        }
+        instruct = str(config.RERANK_INSTRUCT or "").strip()
+        if instruct:
+            parameters["instruct"] = instruct
+
+        response_payload = self._call_rerank_api(
+            {
+                "model": config.RERANK_MODEL,
+                "input": {
+                    "query": {"text": question},
+                    "documents": [
+                        {"text": str(candidate.get("text") or "")}
+                        for candidate in candidates
+                    ],
+                },
+                "parameters": parameters,
+            }
+        )
+        results = (response_payload.get("output") or {}).get("results")
+        if not isinstance(results, list) or not results:
+            raise ValueError("rerank response has no results")
+
+        selected_candidates: list[dict[str, Any]] = []
+        seen_indexes: set[int] = set()
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            index = result.get("index")
+            if not isinstance(index, int) or index in seen_indexes:
+                continue
+            if index < 0 or index >= len(candidates):
+                continue
+            try:
+                rerank_score = float(result.get("relevance_score"))
+            except (TypeError, ValueError):
+                continue
+            if (
+                config.RERANK_SCORE_THRESHOLD is not None
+                and rerank_score < config.RERANK_SCORE_THRESHOLD
+            ):
+                continue
+            seen_indexes.add(index)
+            selected_candidates.append(
+                {
+                    **candidates[index],
+                    "score": rerank_score,
+                    "rerank_score": rerank_score,
+                }
+            )
+
+        if not selected_candidates:
+            raise ValueError("rerank response has no usable results")
+        return selected_candidates
+
+    def _call_rerank_api(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """通过 HTTP 调用阿里百炼 rerank 接口并返回 JSON 响应。"""
+
+        if not config.DASHSCOPE_API_KEY:
+            raise RuntimeError("缺少 DASHSCOPE_API_KEY，无法调用 rerank")
+
+        request = Request(
+            config.RERANK_BASE_URL,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {config.DASHSCOPE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=config.RERANK_TIMEOUT_SECONDS) as response:
+                response_body = response.read().decode("utf-8")
+        except HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"rerank API returned HTTP {exc.code}: {error_body[:300]}"
+            ) from exc
+        except URLError as exc:
+            raise RuntimeError(f"rerank API request failed: {exc.reason}") from exc
+
+        response_payload = json.loads(response_body)
+        if not isinstance(response_payload, dict):
+            raise ValueError("rerank response is not a JSON object")
+        if response_payload.get("code"):
+            raise RuntimeError(
+                f"rerank API returned {response_payload.get('code')}: "
+                f"{response_payload.get('message')}"
+            )
+        return response_payload
+
+    def _limit_vector_candidates(
+        self, candidates: list[dict[str, Any]], top_k: int
+    ) -> list[dict[str, Any]]:
+        """rerank 不可用时，按每个知识库保留原向量召回的前 top_k 个候选。"""
+
+        limited_candidates: list[dict[str, Any]] = []
+        knowledge_base_counts: dict[str, int] = {}
+        for candidate in candidates:
+            knowledge_base_id = str(candidate.get("knowledge_base_id") or "")
+            count = knowledge_base_counts.get(knowledge_base_id, 0)
+            if count >= top_k:
+                continue
+            limited_candidates.append(candidate)
+            knowledge_base_counts[knowledge_base_id] = count + 1
+        return limited_candidates
+
+    def _candidates_to_retrieved_chunks(
+        self, candidates: list[dict[str, Any]], context_char_limit: int
+    ) -> list[dict[str, Any]]:
+        """把最终候选转成聊天层来源片段，并按上下文总长度截断。"""
+
+        retrieved_chunks: list[dict[str, Any]] = []
+        used_chars = 0
+        for candidate in candidates:
+            text = str(candidate.get("text") or "").strip()
+            if not text:
+                continue
+
+            remaining_chars = context_char_limit - used_chars
+            if remaining_chars <= 0:
+                break
+
+            truncated_text = text[:remaining_chars]
+            used_chars += len(truncated_text)
+            retrieved_chunks.append(
+                {
+                    "knowledge_base_id": candidate.get("knowledge_base_id"),
+                    "knowledge_base_name": candidate.get("knowledge_base_name"),
+                    "document_id": candidate.get("document_id"),
+                    "original_filename": candidate.get("original_filename"),
+                    "chunk_index": candidate.get("chunk_index"),
+                    "score": candidate.get("score"),
+                    "text": truncated_text,
+                }
+            )
+
+            if used_chars >= context_char_limit:
+                break
+        return retrieved_chunks
+
+    def _normalize_positive_int(self, value: Any, default_value: int) -> int:
+        """把配置值规范化为正整数，非法值回退到默认值。"""
+
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            return default_value
+        if normalized <= 0:
+            return default_value
+        return normalized
+
     def _normalize_score_threshold(
         self, value: Any, default_score_threshold: float | None
     ) -> float | None:
+        """规范化向量检索分数阈值，非正数表示不启用阈值。"""
+
         if value is None or value == "":
             return default_score_threshold
         try:
@@ -816,6 +1106,8 @@ class KnowledgeBaseService:
         score_threshold: float | None = None,
         hits: list[Any] | None = None,
     ) -> dict[str, Any]:
+        """构造单个知识库的检索日志条目，便于排查召回情况。"""
+
         return {
             "knowledge_base_id": knowledge_base.id,
             "knowledge_base_name": knowledge_base.name,
@@ -839,12 +1131,17 @@ class KnowledgeBaseService:
         retrieval_log_items: list[dict[str, Any]],
         started_at: float,
         retrieved_chunks: list[dict[str, Any]],
+        *,
+        rerank_log: dict[str, Any] | None = None,
     ) -> None:
+        """输出一次知识库检索的聚合日志，包括召回、精排和最终来源数量。"""
+
         elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
         log_payload = {
             "question": question,
             "elapsed_ms": elapsed_ms,
             "retrieved_chunk_count": len(retrieved_chunks),
+            "rerank": rerank_log,
             "knowledge_bases": retrieval_log_items,
         }
         logger.info(
@@ -861,6 +1158,8 @@ class KnowledgeBaseService:
         chunks: list[str],
         vectors: list[list[float]],
     ) -> None:
+        """把文档分块向量及其来源信息批量写入 Qdrant。"""
+
         client = self._get_qdrant_client()
         _, qdrant_models = self._import_qdrant()
         points = [
@@ -883,27 +1182,37 @@ class KnowledgeBaseService:
             raise HTTPException(status_code=502, detail=f"写入 Qdrant 失败: {exc}") from exc
 
     def _build_chunk_point_id(self, document_id: str, chunk_index: int) -> str:
+        """根据文档 ID 和分块序号生成稳定的 Qdrant point ID。"""
+
         # Qdrant 只接受无符号整数或 UUID 作为 point ID，这里生成稳定 UUID。
         namespace = uuid.UUID(hex=document_id)
         return str(uuid.uuid5(namespace, str(chunk_index)))
 
     def _delete_document_artifacts(self, document_snapshot: dict[str, str]) -> None:
+        """清理单个文档对应的向量和本地文件。"""
+
         self._delete_document_vectors(
             document_snapshot["knowledge_base_id"], document_snapshot["id"]
         )
         self._delete_local_document_file(document_snapshot["storage_path"])
 
     def _delete_knowledge_base_artifacts(self, knowledge_base_id: str) -> None:
+        """清理知识库对应的 Qdrant collection 和本地目录。"""
+
         self._delete_knowledge_base_collection(knowledge_base_id)
         self._delete_local_knowledge_base_dir(knowledge_base_id)
 
     def _delete_knowledge_base_collection(self, knowledge_base_id: str) -> None:
+        """删除知识库在 Qdrant 中的 collection。"""
+
         collection_name = self._collection_name(knowledge_base_id)
         if not self._collection_exists(collection_name):
             return
         self._get_qdrant_client().delete_collection(collection_name=collection_name)
 
     def _delete_document_vectors(self, knowledge_base_id: str, document_id: str) -> None:
+        """按 document_id 删除 Qdrant 中属于该文档的全部向量点。"""
+
         collection_name = self._collection_name(knowledge_base_id)
         if not self._collection_exists(collection_name):
             return
@@ -926,17 +1235,23 @@ class KnowledgeBaseService:
         )
 
     def _safe_delete_document_vectors(self, knowledge_base_id: str, document_id: str) -> None:
+        """尽力清理文档向量，失败时静默返回用于异常回滚路径。"""
+
         try:
             self._delete_document_vectors(knowledge_base_id, document_id)
         except Exception:
             return
 
     def _delete_local_document_file(self, storage_path: str) -> None:
+        """删除本地存储中的单个文档文件。"""
+
         path = Path(storage_path)
         if path.exists():
             path.unlink()
 
     def _delete_local_knowledge_base_dir(self, knowledge_base_id: str) -> None:
+        """删除知识库对应的本地文档目录。"""
+
         path = self.storage_root / knowledge_base_id
         if path.exists():
             shutil.rmtree(path)
@@ -944,6 +1259,8 @@ class KnowledgeBaseService:
     def _mark_document_failed(
         self, knowledge_base_id: str, document_id: str, error_message: str
     ) -> None:
+        """把文档处理状态标记为失败，并同步刷新知识库 ready 文档数。"""
+
         session_factory = get_session_factory()
         with session_factory() as session:
             knowledge_base = self._get_knowledge_base_or_404(session, knowledge_base_id)
@@ -975,10 +1292,14 @@ class KnowledgeBaseService:
         return updated_count
 
     def _truncate_error_message(self, error_message: str) -> str:
+        """压缩并截断异常文本，避免过长错误写入数据库。"""
+
         normalized = " ".join((error_message or "未知错误").split())
         return normalized[:1000]
 
     def _count_ready_documents(self, session, knowledge_base_id: str) -> int:
+        """统计指定知识库中状态为 ready 的文档数量。"""
+
         return session.scalar(
             select(func.count(KnowledgeBaseDocument.id)).where(
                 KnowledgeBaseDocument.knowledge_base_id == knowledge_base_id,
@@ -987,14 +1308,20 @@ class KnowledgeBaseService:
         ) or 0
 
     def _collection_name(self, knowledge_base_id: str) -> str:
+        """生成知识库对应的 Qdrant collection 名称。"""
+
         return f"{config.QDRANT_COLLECTION_PREFIX}_{knowledge_base_id}"
 
     def _get_qdrant_client(self) -> Any:
+        """获取已初始化的 Qdrant 客户端。"""
+
         if self.qdrant_client is None:
             raise RuntimeError("Qdrant 客户端尚未初始化")
         return self.qdrant_client
 
     def _import_qdrant(self):
+        """延迟导入 qdrant-client，并在缺依赖时给出明确错误。"""
+
         try:
             from qdrant_client import QdrantClient, models as qdrant_models
         except ModuleNotFoundError as exc:
@@ -1002,12 +1329,16 @@ class KnowledgeBaseService:
         return QdrantClient, qdrant_models
 
     def _get_knowledge_base_or_404(self, session, knowledge_base_id: str) -> KnowledgeBase:
+        """按 ID 获取知识库，不存在时抛出 404。"""
+
         knowledge_base = session.get(KnowledgeBase, knowledge_base_id)
         if knowledge_base is None:
             raise HTTPException(status_code=404, detail="知识库不存在")
         return knowledge_base
 
     def _get_document_or_404(self, session, document_id: str) -> KnowledgeBaseDocument:
+        """按 ID 获取文档记录，不存在时抛出 404。"""
+
         document = session.get(KnowledgeBaseDocument, document_id)
         if document is None:
             raise HTTPException(status_code=404, detail="文档不存在")
@@ -1016,12 +1347,16 @@ class KnowledgeBaseService:
     def _get_knowledge_base_document_or_404(
         self, session, knowledge_base_id: str, document_id: str
     ) -> KnowledgeBaseDocument:
+        """获取指定知识库下的文档，避免跨知识库误操作。"""
+
         document = self._get_document_or_404(session, document_id)
         if document.knowledge_base_id != knowledge_base_id:
             raise HTTPException(status_code=404, detail="文档不存在")
         return document
 
     def _document_snapshot(self, document: KnowledgeBaseDocument) -> dict[str, str]:
+        """提取删除资源所需的文档字段快照，避免会话关闭后访问 ORM 对象。"""
+
         return {
             "id": document.id,
             "knowledge_base_id": document.knowledge_base_id,
@@ -1029,6 +1364,8 @@ class KnowledgeBaseService:
         }
 
     def _to_summary(self, knowledge_base: KnowledgeBase) -> KnowledgeBaseSummary:
+        """把知识库 ORM 对象转换为 API 摘要模型。"""
+
         return KnowledgeBaseSummary(
             id=knowledge_base.id,
             name=knowledge_base.name,
@@ -1042,6 +1379,8 @@ class KnowledgeBaseService:
     def _to_document_summary(
         self, document: KnowledgeBaseDocument
     ) -> KnowledgeBaseDocumentSummary:
+        """把文档 ORM 对象转换为 API 摘要模型。"""
+
         return KnowledgeBaseDocumentSummary(
             id=document.id,
             knowledge_base_id=document.knowledge_base_id,
