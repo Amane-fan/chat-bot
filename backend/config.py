@@ -63,6 +63,13 @@ RERANK_INSTRUCT = os.getenv(
     "Given a web search query, retrieve relevant passages that answer the query.",
 )
 
+# 混合检索默认同时执行向量召回和本地 BM25 召回，再通过 RRF 做融合。
+HYBRID_RETRIEVAL_ENABLED = _get_bool_env("HYBRID_RETRIEVAL_ENABLED", True)
+HYBRID_SPARSE_TOP_K = _get_int_env("HYBRID_SPARSE_TOP_K", 10)
+HYBRID_RRF_K = _get_int_env("HYBRID_RRF_K", 60)
+HYBRID_BM25_K1 = _get_float_env("HYBRID_BM25_K1", 1.5)
+HYBRID_BM25_B = _get_float_env("HYBRID_BM25_B", 0.75)
+
 # MySQL 用于持久化聊天会话、消息历史和知识库元数据。
 MYSQL_HOST = os.getenv("MYSQL_HOST")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))

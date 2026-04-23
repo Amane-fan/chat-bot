@@ -1,9 +1,11 @@
 import json
 import logging
+import math
 import re
 import shutil
 import time
 import uuid
+from collections import Counter
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -36,11 +38,13 @@ DEFAULT_CHUNK_OVERLAP = 50
 DEFAULT_RETRIEVAL_TOP_K = 5
 DEFAULT_RETRIEVAL_CONTEXT_CHAR_LIMIT = 6000
 DEFAULT_RETRIEVAL_SCORE_THRESHOLD = 0.25
+DEFAULT_QDRANT_SCROLL_LIMIT = 256
 PROCESSING_STATUS = "processing"
 READY_STATUS = "ready"
 FAILED_STATUS = "failed"
 ALLOWED_DOCUMENT_EXTENSIONS = {".txt", ".md", ".pdf"}
 DEFAULT_SEPARATORS = ["\n\n", "\n", " ", ""]
+CJK_TOKEN_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+|[A-Za-z0-9]+")
 logger = logging.getLogger("uvicorn.error")
 logger.setLevel(logging.INFO)
 
@@ -158,6 +162,7 @@ class KnowledgeBaseService:
 
         self.qdrant_client: Any | None = None
         self.storage_root = Path(config.DOCUMENT_STORAGE_ROOT).resolve()
+        self.bm25_index_cache: dict[str, dict[str, Any]] = {}
 
     def startup(self) -> None:
         """启动知识库服务，校验依赖并初始化本地存储和 Qdrant 客户端。"""
@@ -346,11 +351,8 @@ class KnowledgeBaseService:
             items = session.scalars(
                 select(KnowledgeBase).where(KnowledgeBase.id.in_(knowledge_base_ids))
             ).all()
-            ready_document_rows = session.execute(
-                select(
-                    KnowledgeBaseDocument.knowledge_base_id,
-                    KnowledgeBaseDocument.id,
-                )
+            ready_documents = session.scalars(
+                select(KnowledgeBaseDocument)
                 .where(
                     KnowledgeBaseDocument.knowledge_base_id.in_(knowledge_base_ids),
                     KnowledgeBaseDocument.status == READY_STATUS,
@@ -358,9 +360,9 @@ class KnowledgeBaseService:
             ).all()
 
         knowledge_base_map = {item.id: item for item in items}
-        ready_document_id_map: dict[str, list[str]] = {}
-        for knowledge_base_id, document_id in ready_document_rows:
-            ready_document_id_map.setdefault(knowledge_base_id, []).append(document_id)
+        ready_document_map: dict[str, list[KnowledgeBaseDocument]] = {}
+        for document in ready_documents:
+            ready_document_map.setdefault(document.knowledge_base_id, []).append(document)
         candidate_chunks: list[dict[str, Any]] = []
         retrieval_log_items: list[dict[str, Any]] = []
         started_at = time.perf_counter()
@@ -371,6 +373,11 @@ class KnowledgeBaseService:
                 top_k,
                 self._normalize_positive_int(config.RERANK_CANDIDATE_TOP_K, top_k),
             )
+        sparse_top_k = max(
+            query_top_k,
+            self._normalize_positive_int(config.HYBRID_SPARSE_TOP_K, query_top_k),
+        )
+        fused_top_k = max(query_top_k, sparse_top_k)
 
         for knowledge_base_ref in knowledge_bases:
             knowledge_base = knowledge_base_map.get(knowledge_base_ref.id)
@@ -383,7 +390,8 @@ class KnowledgeBaseService:
                 )
                 continue
 
-            ready_document_ids = ready_document_id_map.get(knowledge_base.id, [])
+            ready_document_items = ready_document_map.get(knowledge_base.id, [])
+            ready_document_ids = [document.id for document in ready_document_items]
             # document_count 是冗余汇总字段，检索前以文档表实时状态为准。
             if not ready_document_ids:
                 retrieval_log_items.append(
@@ -396,6 +404,11 @@ class KnowledgeBaseService:
 
             try:
                 knowledge_base_config = dict(knowledge_base.config or {})
+                index_status = self._ensure_retrieval_index_ready(
+                    knowledge_base.id,
+                    knowledge_base_config,
+                    ready_document_items,
+                )
                 effective_score_threshold = self._normalize_score_threshold(
                     knowledge_base_config.get("retrieval_score_threshold"),
                     score_threshold,
@@ -403,7 +416,7 @@ class KnowledgeBaseService:
                 query_vector = self._embed_query(
                     knowledge_base_config, normalized_question
                 )
-                hits = self._query_knowledge_base_chunks(
+                dense_hits = self._query_knowledge_base_chunks(
                     knowledge_base.id,
                     query_vector,
                     query_top_k,
@@ -420,18 +433,47 @@ class KnowledgeBaseService:
                 )
                 continue
 
+            sparse_hits: list[dict[str, Any]] = []
+            sparse_cache_status = "disabled"
+            sparse_status = "skipped"
+            if config.HYBRID_RETRIEVAL_ENABLED:
+                try:
+                    sparse_hits, sparse_cache_status = self._query_sparse_knowledge_base_chunks(
+                        knowledge_base.id,
+                        knowledge_base_ref,
+                        normalized_question,
+                        ready_document_ids,
+                        sparse_top_k,
+                    )
+                    sparse_status = "searched"
+                except Exception as exc:
+                    sparse_status = "failed"
+                    sparse_cache_status = f"failed:{type(exc).__name__}"
+
+            dense_candidates = self._build_candidate_chunks(
+                knowledge_base, knowledge_base_ref, dense_hits
+            )
+            fused_candidates = self._fuse_retrieval_candidates(
+                dense_candidates,
+                sparse_hits,
+                fused_top_k,
+            )
+
             retrieval_log_items.append(
                 self._build_retrieval_log_item(
                     knowledge_base_ref,
                     status="searched",
                     score_threshold=effective_score_threshold,
-                    hits=hits,
+                    dense_hits=dense_hits,
+                    sparse_hits=sparse_hits,
+                    fused_candidate_count=len(fused_candidates),
+                    sparse_cache_status=sparse_cache_status,
+                    sparse_status=sparse_status,
+                    index_status=index_status,
                 )
             )
 
-            candidate_chunks.extend(
-                self._build_candidate_chunks(knowledge_base, knowledge_base_ref, hits)
-            )
+            candidate_chunks.extend(fused_candidates)
 
         selected_candidates, rerank_log = self._select_retrieval_candidates(
             normalized_question, candidate_chunks, top_k
@@ -846,6 +888,370 @@ class KnowledgeBaseService:
         )
         return list(response.points or [])
 
+    def _ensure_retrieval_index_ready(
+        self,
+        knowledge_base_id: str,
+        knowledge_base_config: dict[str, Any],
+        ready_documents: list[KnowledgeBaseDocument],
+    ) -> str:
+        """在检索前确保知识库向量索引存在，必要时从本地文档重建。"""
+
+        collection_name = self._collection_name(knowledge_base_id)
+        if self._collection_exists(collection_name):
+            return "existing"
+        if not ready_documents:
+            return "missing_no_ready_documents"
+
+        self._rebuild_knowledge_base_vectors_from_documents(
+            knowledge_base_id,
+            knowledge_base_config,
+            ready_documents,
+        )
+        return "rebuilt_from_local_documents"
+
+    def _rebuild_knowledge_base_vectors_from_documents(
+        self,
+        knowledge_base_id: str,
+        knowledge_base_config: dict[str, Any],
+        ready_documents: list[KnowledgeBaseDocument],
+    ) -> None:
+        """当 Qdrant 索引缺失时，基于本地文档和数据库元信息重建向量。"""
+
+        collection_name = self._collection_name(knowledge_base_id)
+        rebuilt_any_document = False
+        for document in ready_documents:
+            document_path = Path(document.storage_path)
+            if not document_path.exists():
+                logger.warning(
+                    "知识库索引重建时缺少本地文件: knowledge_base_id=%s document_id=%s path=%s",
+                    knowledge_base_id,
+                    document.id,
+                    document.storage_path,
+                )
+                continue
+
+            file_bytes = document_path.read_bytes()
+            text = self._extract_document_text(document.original_filename, file_bytes)
+            chunks = self._split_document_text(knowledge_base_config, text)
+            vectors = self._embed_document_chunks(knowledge_base_config, chunks)
+            if not vectors:
+                continue
+            self._ensure_collection(collection_name, len(vectors[0]))
+            self._upsert_document_chunks(
+                collection_name=collection_name,
+                knowledge_base_id=knowledge_base_id,
+                document_id=document.id,
+                original_filename=document.original_filename,
+                chunks=chunks,
+                vectors=vectors,
+            )
+            rebuilt_any_document = True
+
+        self._invalidate_sparse_index_cache(knowledge_base_id)
+        if not rebuilt_any_document:
+            raise RuntimeError("知识库索引缺失，且无法从本地文档重建")
+
+    def _query_sparse_knowledge_base_chunks(
+        self,
+        knowledge_base_id: str,
+        knowledge_base_ref: KnowledgeBaseReference,
+        question: str,
+        ready_document_ids: list[str],
+        top_k: int,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """基于知识库 chunk 文本构建 BM25 索引并执行稀疏召回。"""
+
+        bm25_index, cache_status = self._get_or_build_bm25_index(
+            knowledge_base_id, ready_document_ids
+        )
+        return (
+            self._search_bm25_index(
+                bm25_index, knowledge_base_id, knowledge_base_ref, question, top_k
+            ),
+            cache_status,
+        )
+
+    def _get_or_build_bm25_index(
+        self, knowledge_base_id: str, ready_document_ids: list[str]
+    ) -> tuple[dict[str, Any], str]:
+        """按知识库获取 BM25 缓存，若文档集合变化则重建。"""
+
+        ready_document_signature = self._build_ready_document_signature(ready_document_ids)
+        cached_index = self.bm25_index_cache.get(knowledge_base_id)
+        if (
+            cached_index is not None
+            and cached_index.get("ready_document_signature") == ready_document_signature
+        ):
+            return cached_index, "hit"
+
+        bm25_index = self._build_bm25_index(knowledge_base_id, ready_document_ids)
+        self.bm25_index_cache[knowledge_base_id] = bm25_index
+        return bm25_index, "rebuilt"
+
+    def _build_bm25_index(
+        self, knowledge_base_id: str, ready_document_ids: list[str]
+    ) -> dict[str, Any]:
+        """从 Qdrant payload 拉取全文块并构建 BM25 统计量。"""
+
+        chunk_payloads = self._scroll_knowledge_base_chunk_payloads(
+            knowledge_base_id, ready_document_ids
+        )
+        term_frequencies: list[Counter[str]] = []
+        document_frequencies: Counter[str] = Counter()
+        document_lengths: list[int] = []
+        chunk_records: list[dict[str, Any]] = []
+
+        for payload in chunk_payloads:
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                continue
+            tokens = self._tokenize_for_sparse_retrieval(text)
+            if not tokens:
+                continue
+            term_frequency = Counter(tokens)
+            term_frequencies.append(term_frequency)
+            document_lengths.append(sum(term_frequency.values()))
+            document_frequencies.update(term_frequency.keys())
+            chunk_records.append(
+                {
+                    "document_id": payload.get("document_id"),
+                    "original_filename": payload.get("original_filename"),
+                    "chunk_index": payload.get("chunk_index"),
+                    "text": text,
+                }
+            )
+
+        document_count = len(chunk_records)
+        average_document_length = (
+            sum(document_lengths) / document_count if document_count else 0.0
+        )
+        inverse_document_frequency = {
+            token: math.log(1 + ((document_count - frequency + 0.5) / (frequency + 0.5)))
+            for token, frequency in document_frequencies.items()
+        }
+        return {
+            "ready_document_signature": self._build_ready_document_signature(
+                ready_document_ids
+            ),
+            "chunks": chunk_records,
+            "term_frequencies": term_frequencies,
+            "document_lengths": document_lengths,
+            "average_document_length": average_document_length,
+            "inverse_document_frequency": inverse_document_frequency,
+        }
+
+    def _scroll_knowledge_base_chunk_payloads(
+        self, knowledge_base_id: str, ready_document_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """滚动读取知识库中 ready 文档的全部 chunk payload。"""
+
+        collection_name = self._collection_name(knowledge_base_id)
+        if not self._collection_exists(collection_name):
+            return []
+
+        _, qdrant_models = self._import_qdrant()
+        scroll_filter = qdrant_models.Filter(
+            must=[
+                qdrant_models.FieldCondition(
+                    key="document_id",
+                    match=qdrant_models.MatchAny(any=ready_document_ids),
+                )
+            ]
+        )
+
+        payloads: list[dict[str, Any]] = []
+        next_offset: Any | None = None
+        client = self._get_qdrant_client()
+        while True:
+            response = client.scroll(
+                collection_name=collection_name,
+                scroll_filter=scroll_filter,
+                limit=DEFAULT_QDRANT_SCROLL_LIMIT,
+                with_payload=True,
+                with_vectors=False,
+                offset=next_offset,
+            )
+            if isinstance(response, tuple):
+                points, next_offset = response
+            else:
+                points = getattr(response, "points", []) or []
+                next_offset = getattr(response, "next_page_offset", None)
+
+            for point in points:
+                payload = point.payload or {}
+                if payload:
+                    payloads.append(payload)
+
+            if next_offset is None:
+                break
+        return payloads
+
+    def _search_bm25_index(
+        self,
+        bm25_index: dict[str, Any],
+        knowledge_base_id: str,
+        knowledge_base_ref: KnowledgeBaseReference,
+        question: str,
+        top_k: int,
+    ) -> list[dict[str, Any]]:
+        """在构建好的 BM25 索引上执行查询并返回候选块。"""
+
+        query_tokens = self._tokenize_for_sparse_retrieval(question)
+        if not query_tokens:
+            return []
+
+        chunks = bm25_index.get("chunks") or []
+        if not chunks:
+            return []
+
+        average_document_length = float(bm25_index.get("average_document_length") or 0.0)
+        inverse_document_frequency = dict(bm25_index.get("inverse_document_frequency") or {})
+        document_lengths = list(bm25_index.get("document_lengths") or [])
+        term_frequencies = list(bm25_index.get("term_frequencies") or [])
+        query_term_frequencies = Counter(query_tokens)
+        scored_candidates: list[dict[str, Any]] = []
+        k1 = max(0.01, float(config.HYBRID_BM25_K1))
+        b = min(max(float(config.HYBRID_BM25_B), 0.0), 1.0)
+
+        for index, chunk in enumerate(chunks):
+            if index >= len(term_frequencies) or index >= len(document_lengths):
+                continue
+            term_frequency = term_frequencies[index]
+            document_length = document_lengths[index]
+            score = 0.0
+            for token, query_term_frequency in query_term_frequencies.items():
+                token_frequency = term_frequency.get(token, 0)
+                if token_frequency <= 0:
+                    continue
+                inverse_document_frequency_value = inverse_document_frequency.get(token, 0.0)
+                denominator = token_frequency + k1 * (
+                    1 - b + b * (document_length / average_document_length)
+                ) if average_document_length > 0 else token_frequency + k1
+                if denominator <= 0:
+                    continue
+                score += (
+                    inverse_document_frequency_value
+                    * ((token_frequency * (k1 + 1)) / denominator)
+                    * query_term_frequency
+                )
+            if score <= 0:
+                continue
+            scored_candidates.append(
+                {
+                    "knowledge_base_id": knowledge_base_id,
+                    "knowledge_base_name": knowledge_base_ref.name,
+                    "document_id": chunk.get("document_id"),
+                    "original_filename": chunk.get("original_filename"),
+                    "chunk_index": chunk.get("chunk_index"),
+                    "score": score,
+                    "sparse_score": score,
+                    "text": chunk.get("text"),
+                }
+            )
+
+        scored_candidates.sort(
+            key=lambda item: (
+                float(item.get("score") or 0.0),
+                -int(item.get("chunk_index") or 0),
+            ),
+            reverse=True,
+        )
+        return scored_candidates[:top_k]
+
+    def _tokenize_for_sparse_retrieval(self, text: str) -> list[str]:
+        """对英文和中文文本做轻量切词，兼顾关键词与短语匹配。"""
+
+        tokens: list[str] = []
+        for match in CJK_TOKEN_PATTERN.finditer(text or ""):
+            segment = match.group(0)
+            if not segment:
+                continue
+            if segment.isascii():
+                normalized = segment.lower().strip()
+                if normalized:
+                    tokens.append(normalized)
+                continue
+
+            characters = [character for character in segment.strip() if character.strip()]
+            tokens.extend(characters)
+            tokens.extend(
+                f"{characters[index]}{characters[index + 1]}"
+                for index in range(len(characters) - 1)
+            )
+        return [token for token in tokens if token]
+
+    def _fuse_retrieval_candidates(
+        self,
+        dense_candidates: list[dict[str, Any]],
+        sparse_candidates: list[dict[str, Any]],
+        top_k: int,
+    ) -> list[dict[str, Any]]:
+        """使用 Reciprocal Rank Fusion 融合向量召回和 BM25 召回结果。"""
+
+        if not config.HYBRID_RETRIEVAL_ENABLED:
+            return dense_candidates[:top_k]
+
+        fused_candidates: dict[str, dict[str, Any]] = {}
+        rrf_k = max(1, self._normalize_positive_int(config.HYBRID_RRF_K, 60))
+        ranked_candidate_lists = [dense_candidates, sparse_candidates]
+        for candidates in ranked_candidate_lists:
+            for rank, candidate in enumerate(candidates, start=1):
+                candidate_key = self._candidate_key(candidate)
+                fused_candidate = fused_candidates.setdefault(
+                    candidate_key,
+                    {
+                        **candidate,
+                        "score": 0.0,
+                    },
+                )
+                fused_candidate["score"] = float(fused_candidate.get("score") or 0.0) + (
+                    1.0 / (rrf_k + rank)
+                )
+                for field_name in ("vector_score", "sparse_score"):
+                    if field_name in candidate and candidate.get(field_name) is not None:
+                        fused_candidate[field_name] = candidate.get(field_name)
+                if not fused_candidate.get("text"):
+                    fused_candidate["text"] = candidate.get("text")
+                if fused_candidate.get("document_id") is None:
+                    fused_candidate["document_id"] = candidate.get("document_id")
+                if fused_candidate.get("original_filename") is None:
+                    fused_candidate["original_filename"] = candidate.get("original_filename")
+                if fused_candidate.get("chunk_index") is None:
+                    fused_candidate["chunk_index"] = candidate.get("chunk_index")
+
+        sorted_candidates = sorted(
+            fused_candidates.values(),
+            key=lambda item: (
+                float(item.get("score") or 0.0),
+                float(item.get("vector_score") or 0.0),
+                float(item.get("sparse_score") or 0.0),
+            ),
+            reverse=True,
+        )
+        return sorted_candidates[:top_k]
+
+    def _candidate_key(self, candidate: dict[str, Any]) -> str:
+        """为跨召回路由的同一 chunk 生成稳定键。"""
+
+        return "::".join(
+            [
+                str(candidate.get("knowledge_base_id") or ""),
+                str(candidate.get("document_id") or ""),
+                str(candidate.get("chunk_index") or ""),
+                str(candidate.get("original_filename") or ""),
+            ]
+        )
+
+    def _build_ready_document_signature(self, ready_document_ids: list[str]) -> str:
+        """把 ready 文档集合转换成稳定签名，用于缓存比对。"""
+
+        return "|".join(sorted(str(document_id) for document_id in ready_document_ids))
+
+    def _invalidate_sparse_index_cache(self, knowledge_base_id: str) -> None:
+        """使指定知识库的 BM25 缓存失效。"""
+
+        self.bm25_index_cache.pop(knowledge_base_id, None)
+
     def _build_candidate_chunks(
         self,
         knowledge_base: KnowledgeBase,
@@ -1105,15 +1511,29 @@ class KnowledgeBaseService:
         status: str,
         score_threshold: float | None = None,
         hits: list[Any] | None = None,
+        dense_hits: list[Any] | None = None,
+        sparse_hits: list[dict[str, Any]] | None = None,
+        fused_candidate_count: int | None = None,
+        sparse_cache_status: str | None = None,
+        sparse_status: str | None = None,
+        index_status: str | None = None,
     ) -> dict[str, Any]:
         """构造单个知识库的检索日志条目，便于排查召回情况。"""
 
+        effective_dense_hits = dense_hits if dense_hits is not None else hits or []
+        effective_sparse_hits = sparse_hits or []
         return {
             "knowledge_base_id": knowledge_base.id,
             "knowledge_base_name": knowledge_base.name,
             "status": status,
             "score_threshold": score_threshold,
-            "hit_count": len(hits or []),
+            "dense_hit_count": len(effective_dense_hits),
+            "sparse_hit_count": len(effective_sparse_hits),
+            "fused_candidate_count": fused_candidate_count,
+            "sparse_cache_status": sparse_cache_status,
+            "sparse_status": sparse_status,
+            "index_status": index_status,
+            "hit_count": len(effective_dense_hits),
             "hits": [
                 {
                     "score": getattr(hit, "score", None),
@@ -1121,7 +1541,16 @@ class KnowledgeBaseService:
                     "original_filename": (hit.payload or {}).get("original_filename"),
                     "chunk_index": (hit.payload or {}).get("chunk_index"),
                 }
-                for hit in hits or []
+                for hit in effective_dense_hits
+            ],
+            "sparse_hits": [
+                {
+                    "score": hit.get("score"),
+                    "document_id": hit.get("document_id"),
+                    "original_filename": hit.get("original_filename"),
+                    "chunk_index": hit.get("chunk_index"),
+                }
+                for hit in effective_sparse_hits
             ],
         }
 

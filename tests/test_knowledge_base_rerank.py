@@ -2,6 +2,7 @@ import unittest
 from typing import Any
 
 from backend import config
+from backend.schemas import KnowledgeBaseReference
 from backend.services.knowledge_base_service import KnowledgeBaseService
 
 
@@ -126,6 +127,45 @@ class KnowledgeBaseRerankTest(unittest.TestCase):
 
         self.assertEqual(["doc-b"], [item["document_id"] for item in selected])
         self.assertEqual("succeeded", rerank_log["status"])
+
+    def test_hybrid_retrieval_log_item_accepts_dense_and_sparse_hits(self) -> None:
+        service = KnowledgeBaseService()
+        knowledge_base_ref = KnowledgeBaseReference(id="kb-1", name="KB")
+        dense_hit = type(
+            "DenseHit",
+            (),
+            {
+                "score": 0.82,
+                "payload": {
+                    "document_id": "doc-a",
+                    "original_filename": "doc-a.md",
+                    "chunk_index": 0,
+                },
+            },
+        )()
+        sparse_hit = {
+            "score": 1.23,
+            "document_id": "doc-b",
+            "original_filename": "doc-b.md",
+            "chunk_index": 1,
+        }
+
+        log_item = service._build_retrieval_log_item(
+            knowledge_base_ref,
+            status="searched",
+            dense_hits=[dense_hit],
+            sparse_hits=[sparse_hit],
+            fused_candidate_count=2,
+            sparse_cache_status="hit",
+            sparse_status="searched",
+        )
+
+        self.assertEqual(1, log_item["dense_hit_count"])
+        self.assertEqual(1, log_item["sparse_hit_count"])
+        self.assertEqual(2, log_item["fused_candidate_count"])
+        self.assertEqual("hit", log_item["sparse_cache_status"])
+        self.assertEqual("doc-a", log_item["hits"][0]["document_id"])
+        self.assertEqual("doc-b", log_item["sparse_hits"][0]["document_id"])
 
     def _candidate(
         self,
