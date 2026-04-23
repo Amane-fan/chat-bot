@@ -21,6 +21,19 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS chat_session_memories (
+  session_id CHAR(32) NOT NULL,
+  summary_text TEXT NOT NULL,
+  summarized_message_count INT NOT NULL DEFAULT 0,
+  created_at DATETIME(6) NOT NULL,
+  updated_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (session_id),
+  KEY ix_chat_session_memories_updated_at (updated_at),
+  CONSTRAINT fk_chat_session_memories_session_id
+    FOREIGN KEY (session_id) REFERENCES chat_sessions (id)
+    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS knowledge_bases (
   id CHAR(32) NOT NULL,
   name VARCHAR(80) NOT NULL,

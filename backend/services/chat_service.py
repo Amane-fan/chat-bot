@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -15,7 +16,13 @@ from sqlalchemy.orm import Session
 
 from backend import config
 from backend.db import get_engine, get_session_factory, init_mysql
-from backend.models import ChatMessage, ChatSession, KnowledgeBase, SessionKnowledgeBase
+from backend.models import (
+    ChatMessage,
+    ChatSession,
+    ChatSessionMemory,
+    KnowledgeBase,
+    SessionKnowledgeBase,
+)
 from backend.schemas import (
     ChatExchangeResponse,
     KnowledgeBaseRetrievedChunk,
@@ -37,6 +44,16 @@ QUESTION_REWRITE_SYSTEM_PROMPT = (
     "请结合已有对话历史补全指代、省略和上下文，但不要引入历史中不存在的信息。"
     "如果当前问题已经足够独立，请原样或近似原样返回。"
     "只输出改写后的问题，不要解释、不要添加前缀。"
+)
+MEMORY_SUMMARY_SYSTEM_PROMPT = (
+    "你负责维护一个会话的长期摘要记忆。"
+    "请把已有摘要与新增对话融合成简洁、准确、可延续的中文摘要。"
+    "优先保留：用户目标、关键事实、限制条件、偏好、已做决定、待跟进事项。"
+    "删除：寒暄、重复表达、逐字转录、来源编号、无关细节。"
+    "只输出更新后的摘要正文，不要解释。"
+)
+LEGACY_REFERENCE_SECTION_PATTERN = re.compile(
+    r"\n\n参考来源：\n(?:\[来源 \d+\].*(?:\n|$))+\s*$"
 )
 logger = logging.getLogger("uvicorn.error")
 logger.setLevel(logging.INFO)
@@ -62,6 +79,7 @@ class ChatService:
     def __init__(self, knowledge_base_service: KnowledgeBaseService | None = None) -> None:
         self.chain = None
         self.rewrite_chain = None
+        self.summary_chain = None
         self.knowledge_base_service = knowledge_base_service
 
     def startup(self) -> None:
@@ -76,7 +94,12 @@ class ChatService:
             inspector = inspect(engine)
             missing_tables = [
                 table_name
-                for table_name in ("chat_sessions", "chat_messages", "session_knowledge_bases")
+                for table_name in (
+                    "chat_sessions",
+                    "chat_messages",
+                    "chat_session_memories",
+                    "session_knowledge_bases",
+                )
                 if not inspector.has_table(table_name)
             ]
             if missing_tables:
@@ -96,9 +119,21 @@ class ChatService:
         )
         rewrite_prompt = ChatPromptTemplate.from_messages(
             [
-                ("system", QUESTION_REWRITE_SYSTEM_PROMPT),
+                ("system", "{rewrite_system_prompt}"),
                 MessagesPlaceholder("history", optional=True),
                 ("human", "当前用户问题：{question}\n\n请输出改写后的问题："),
+            ]
+        )
+        summary_prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", MEMORY_SUMMARY_SYSTEM_PROMPT),
+                (
+                    "human",
+                    "已有摘要：\n{existing_summary}\n\n"
+                    "请融合以下新增对话片段，输出更新后的摘要。"
+                    "摘要尽量控制在 {max_chars} 字以内。\n\n"
+                    "新增对话片段：\n{new_messages}",
+                ),
             ]
         )
         model = ChatOpenAI(
@@ -108,6 +143,7 @@ class ChatService:
         )
         self.chain = prompt | model | StrOutputParser()
         self.rewrite_chain = rewrite_prompt | model | StrOutputParser()
+        self.summary_chain = summary_prompt | model | StrOutputParser()
 
     def list_sessions(self) -> list[SessionSummary]:
         """按最近活跃时间返回会话列表。"""
@@ -233,10 +269,9 @@ class ChatService:
         llm_payload = prepared_request["llm_payload"]
 
         try:
-            answer = self._get_chain().invoke(llm_payload)
+            answer = str(self._get_chain().invoke(llm_payload)).strip()
         except Exception as exc:
             raise HTTPException(status_code=502, detail="模型调用失败") from exc
-        answer = self._append_reference_section(answer, retrieved_chunks)
         retrieved_chunk_payload = self._serialize_retrieved_chunks(retrieved_chunks)
 
         user_message_created_at = utc_now()
@@ -269,6 +304,8 @@ class ChatService:
                 chat_session,
                 self._count_messages(session, session_id),
             )
+
+        self._refresh_session_memory_best_effort(session_id)
 
         return ChatExchangeResponse(
             session=summary,
@@ -322,11 +359,7 @@ class ChatService:
             yield self._stream_event("error", {"detail": "模型调用失败"})
             return
 
-        raw_answer = "".join(answer_parts)
-        answer = self._append_reference_section(raw_answer, retrieved_chunks)
-        reference_suffix = answer[len(raw_answer) :]
-        if reference_suffix:
-            yield self._stream_event("token", {"content": reference_suffix})
+        answer = "".join(answer_parts).strip()
 
         with session_factory() as session:
             chat_session = self._get_session_or_404(session, session_id)
@@ -357,6 +390,8 @@ class ChatService:
                 chat_session,
                 self._count_messages(session, session_id),
             )
+
+        self._refresh_session_memory_best_effort(session_id)
 
         exchange = ChatExchangeResponse(
             session=summary,
@@ -394,6 +429,11 @@ class ChatService:
             raise RuntimeError("问题重写链尚未初始化")
         return self.rewrite_chain
 
+    def _get_summary_chain(self):
+        if self.summary_chain is None:
+            raise RuntimeError("摘要链尚未初始化")
+        return self.summary_chain
+
     def _prepare_chat_request(
         self,
         *,
@@ -405,24 +445,28 @@ class ChatService:
         session_factory = get_session_factory()
         with session_factory() as session:
             self._get_session_or_404(session, session_id)
-            history = self._load_history(session, session_id)
+            context_messages = self._load_context_messages(session, session_id)
             knowledge_bases = self._list_knowledge_bases_for_sessions(
                 session, [session_id]
             ).get(session_id, [])
 
-        rewritten_question, rewrite_fallback_reason = self._rewrite_question(
+        memory_summary, history, memory_fallback_reason = self._build_memory_context(
+            session_id, context_messages
+        )
+        retrieval_question, rewrite_fallback_reason = self._rewrite_question(
             request_id=request_id,
             session_id=session_id,
             original_question=original_question,
             history=history,
+            memory_summary=memory_summary,
         )
         retrieved_chunks = self._retrieve_knowledge_chunks(
-            rewritten_question, knowledge_bases
+            retrieval_question, knowledge_bases
         )
-        system_prompt = self._build_system_prompt(retrieved_chunks)
+        system_prompt = self._build_system_prompt(retrieved_chunks, memory_summary)
         llm_payload = {
             "system_prompt": system_prompt,
-            "question": rewritten_question,
+            "question": original_question,
             "history": history,
         }
         self._log_chat_request(
@@ -430,22 +474,22 @@ class ChatService:
             request_mode=request_mode,
             session_id=session_id,
             original_question=original_question,
-            rewritten_question=rewritten_question,
-            rewrite_fallback_reason=rewrite_fallback_reason,
+            retrieval_question=retrieval_question,
             history=history,
-            system_prompt=system_prompt,
-            llm_payload=llm_payload,
-            knowledge_bases=knowledge_bases,
-            retrieved_chunks=retrieved_chunks,
+            rewrite_fallback_reason=rewrite_fallback_reason,
+            memory_summary=memory_summary,
+            memory_fallback_reason=memory_fallback_reason,
         )
         return {
             "request_id": request_id,
             "history": history,
+            "memory_summary": memory_summary,
             "knowledge_bases": knowledge_bases,
             "retrieved_chunks": retrieved_chunks,
             "llm_payload": llm_payload,
-            "rewritten_question": rewritten_question,
+            "retrieval_question": retrieval_question,
             "rewrite_fallback_reason": rewrite_fallback_reason,
+            "memory_fallback_reason": memory_fallback_reason,
         }
 
     def _rewrite_question(
@@ -455,8 +499,13 @@ class ChatService:
         session_id: str,
         original_question: str,
         history: list[dict[str, str]],
+        memory_summary: str | None,
     ) -> tuple[str, str | None]:
+        if not history and not memory_summary:
+            return original_question, None
+
         rewrite_payload = {
+            "rewrite_system_prompt": self._build_rewrite_system_prompt(memory_summary),
             "question": original_question,
             "history": history,
         }
@@ -485,6 +534,250 @@ class ChatService:
                 ),
             )
             return original_question, fallback_reason
+
+    def _build_memory_context(
+        self, session_id: str, context_messages: list[dict[str, Any]]
+    ) -> tuple[str | None, list[dict[str, str]], str | None]:
+        threshold = self._get_summarize_after_message_limit()
+        if len(context_messages) <= threshold:
+            return None, self._messages_to_history(context_messages), None
+
+        try:
+            memory_summary, summarized_message_count = self._ensure_session_memory(
+                session_id, context_messages
+            )
+        except Exception as exc:
+            fallback_reason = type(exc).__name__
+            logger.warning(
+                "Session memory refresh failed; falling back to full history: %s",
+                json.dumps(
+                    {
+                        "session_id": session_id,
+                        "error_type": fallback_reason,
+                        "error_message": str(exc),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+            )
+            return None, self._messages_to_history(context_messages), fallback_reason
+
+        if not memory_summary or summarized_message_count <= 0:
+            return None, self._messages_to_history(context_messages), None
+
+        recent_messages = context_messages[summarized_message_count:]
+        if not recent_messages:
+            recent_messages = self._slice_recent_turn_messages(
+                context_messages, self._get_shared_recent_turn_limit()
+            )
+        return memory_summary, self._messages_to_history(recent_messages), None
+
+    def _ensure_session_memory(
+        self, session_id: str, context_messages: list[dict[str, Any]]
+    ) -> tuple[str | None, int]:
+        threshold = self._get_summarize_after_message_limit()
+        if len(context_messages) <= threshold:
+            return None, 0
+
+        target_summarized_count = self._get_recent_turn_start_index(
+            context_messages, self._get_shared_recent_turn_limit()
+        )
+        if target_summarized_count <= 0:
+            return None, 0
+
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            stored_memory = session.get(ChatSessionMemory, session_id)
+
+        existing_summary = ""
+        existing_count = 0
+        if stored_memory is not None and stored_memory.summary_text.strip():
+            existing_summary = stored_memory.summary_text.strip()
+            existing_count = int(stored_memory.summarized_message_count or 0)
+
+        if target_summarized_count < existing_count:
+            existing_summary = ""
+            existing_count = 0
+
+        if target_summarized_count == existing_count and existing_summary:
+            return existing_summary, existing_count
+
+        messages_to_summarize = context_messages[existing_count:target_summarized_count]
+        if not messages_to_summarize:
+            if existing_summary:
+                return existing_summary, existing_count
+            return None, 0
+
+        updated_summary = self._summarize_messages(existing_summary, messages_to_summarize)
+        self._upsert_session_memory(session_id, updated_summary, target_summarized_count)
+        return updated_summary, target_summarized_count
+
+    def _refresh_session_memory_best_effort(self, session_id: str) -> None:
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            if session.get(ChatSession, session_id) is None:
+                return
+            context_messages = self._load_context_messages(session, session_id)
+
+        try:
+            self._ensure_session_memory(session_id, context_messages)
+        except Exception:
+            logger.warning(
+                "Session memory refresh failed after response: %s",
+                json.dumps({"session_id": session_id}, ensure_ascii=False),
+            )
+
+    def _summarize_messages(
+        self, existing_summary: str, messages: list[dict[str, Any]]
+    ) -> str:
+        formatted_messages = self._format_messages_for_summary(messages)
+        if not formatted_messages:
+            if existing_summary.strip():
+                return self._truncate_summary_text(existing_summary)
+            raise ValueError("no messages available for summarization")
+
+        summary = str(
+            self._get_summary_chain().invoke(
+                {
+                    "existing_summary": existing_summary.strip() or "（暂无）",
+                    "new_messages": formatted_messages,
+                    "max_chars": self._get_summary_max_chars(),
+                }
+            )
+        ).strip()
+        if not summary:
+            raise ValueError("summary chain returned empty summary")
+        return self._truncate_summary_text(summary)
+
+    def _upsert_session_memory(
+        self, session_id: str, summary_text: str, summarized_message_count: int
+    ) -> None:
+        now = utc_now()
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            memory = session.get(ChatSessionMemory, session_id)
+            if memory is None:
+                memory = ChatSessionMemory(
+                    session_id=session_id,
+                    summary_text=summary_text,
+                    summarized_message_count=summarized_message_count,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(memory)
+            else:
+                memory.summary_text = summary_text
+                memory.summarized_message_count = summarized_message_count
+                memory.updated_at = now
+            session.commit()
+
+    def _load_context_messages(
+        self, session: Session, session_id: str
+    ) -> list[dict[str, Any]]:
+        rows = session.execute(
+            select(ChatMessage.id, ChatMessage.role, ChatMessage.content)
+            .where(ChatMessage.session_id == session_id)
+            .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+        ).all()
+        return [
+            {"id": message_id, "role": role, "content": content}
+            for message_id, role, content in rows
+        ]
+
+    def _messages_to_history(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, str]]:
+        history: list[dict[str, str]] = []
+        for message in messages:
+            history.append(
+                {
+                    "role": str(message.get("role") or ""),
+                    "content": self._sanitize_context_message(
+                        str(message.get("role") or ""),
+                        str(message.get("content") or ""),
+                    ),
+                }
+            )
+        return history
+
+    def _format_messages_for_summary(self, messages: list[dict[str, Any]]) -> str:
+        lines: list[str] = []
+        for message in messages:
+            role = str(message.get("role") or "")
+            content = self._sanitize_context_message(
+                role, str(message.get("content") or "")
+            )
+            if not content:
+                continue
+            speaker = "用户" if role == "user" else "助手"
+            lines.append(f"{speaker}：{content}")
+        return "\n".join(lines)
+
+    def _sanitize_context_message(self, role: str, content: str) -> str:
+        normalized = content.strip()
+        if role == "assistant" and normalized:
+            normalized = LEGACY_REFERENCE_SECTION_PATTERN.sub("", normalized).rstrip()
+        return normalized
+
+    def _slice_recent_turn_messages(
+        self, messages: list[dict[str, Any]], recent_turns: int
+    ) -> list[dict[str, Any]]:
+        start_index = self._get_recent_turn_start_index(messages, recent_turns)
+        return messages[start_index:]
+
+    def _get_recent_turn_start_index(
+        self, messages: list[dict[str, Any]], recent_turns: int
+    ) -> int:
+        normalized_recent_turns = max(1, recent_turns)
+        user_indexes = [
+            index for index, message in enumerate(messages) if message.get("role") == "user"
+        ]
+        if len(user_indexes) <= normalized_recent_turns:
+            return 0
+        return user_indexes[-normalized_recent_turns]
+
+    def _get_shared_recent_turn_limit(self) -> int:
+        return max(
+            self._normalize_positive_int(config.CHAT_MEMORY_RECENT_TURNS, 4),
+            self._normalize_positive_int(config.CHAT_MEMORY_REWRITE_RECENT_TURNS, 4),
+        )
+
+    def _get_summarize_after_message_limit(self) -> int:
+        return self._normalize_positive_int(config.CHAT_MEMORY_SUMMARIZE_AFTER_MESSAGES, 12)
+
+    def _get_summary_max_chars(self) -> int:
+        return max(
+            200,
+            self._normalize_positive_int(config.CHAT_MEMORY_SUMMARY_MAX_CHARS, 2000),
+        )
+
+    def _normalize_positive_int(self, value: Any, default_value: int) -> int:
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            return default_value
+        if normalized <= 0:
+            return default_value
+        return normalized
+
+    def _truncate_summary_text(self, summary: str) -> str:
+        normalized = " ".join(summary.split())
+        max_chars = self._get_summary_max_chars()
+        if len(normalized) <= max_chars:
+            return normalized
+        return normalized[: max_chars - 1].rstrip() + "…"
+
+    def _build_rewrite_system_prompt(self, memory_summary: str | None) -> str:
+        if not memory_summary:
+            return QUESTION_REWRITE_SYSTEM_PROMPT
+        return "\n\n".join(
+            [
+                QUESTION_REWRITE_SYSTEM_PROMPT,
+                "以下是当前会话更早历史的摘要，仅用于补全上下文，不代表当前用户最新意图：",
+                memory_summary,
+            ]
+        )
 
     def _ensure_chat_message_columns(self, inspector) -> None:
         column_names = {
@@ -526,84 +819,46 @@ class ChatService:
         request_mode: str,
         session_id: str,
         original_question: str,
-        rewritten_question: str,
-        rewrite_fallback_reason: str | None,
+        retrieval_question: str,
         history: list[dict[str, str]],
-        system_prompt: str,
-        llm_payload: dict[str, Any],
-        knowledge_bases: list[KnowledgeBaseReference],
-        retrieved_chunks: list[dict[str, Any]],
+        rewrite_fallback_reason: str | None,
+        memory_summary: str | None,
+        memory_fallback_reason: str | None,
     ) -> None:
-        question_was_rewritten = rewritten_question != original_question
-        log_history = self._mask_ai_outputs_in_history(history)
-        log_llm_payload = {
-            **llm_payload,
-            "history": log_history,
-        }
+        question_was_rewritten = retrieval_question != original_question
         log_payload = {
             "request_id": request_id,
             "request_mode": request_mode,
             "session_id": session_id,
-            "model": config.DASHSCOPE_DEFAULT_MODEL,
-            "original_question": original_question,
-            "rewritten_question": rewritten_question,
+            "retrieval_question": retrieval_question,
             "question_was_rewritten": question_was_rewritten,
             "rewrite_status": "fallback" if rewrite_fallback_reason else "success",
             "rewrite_fallback_reason": rewrite_fallback_reason,
-            "rewrite_payload": {
-                "question": original_question,
-                "history": log_history,
-            },
-            "history": log_history,
-            "system_prompt": system_prompt,
-            "llm_payload": log_llm_payload,
-            "knowledge_bases": [
-                knowledge_base.model_dump() for knowledge_base in knowledge_bases
-            ],
-            "retrieved_chunk_count": len(retrieved_chunks),
-            "retrieved_sources": self._build_retrieved_source_log_items(
-                retrieved_chunks
-            ),
+            "history": history,
+            "memory_summary": memory_summary,
+            "memory_summary_present": bool(memory_summary),
+            "memory_fallback_reason": memory_fallback_reason,
         }
         logger.info(
             "Chat request payload: %s",
             json.dumps(log_payload, ensure_ascii=False, indent=2, default=str),
         )
 
-    def _mask_ai_outputs_in_history(
-        self, history: list[dict[str, str]]
-    ) -> list[dict[str, str]]:
-        return [
-            {
-                **message,
-                "content": (
-                    "..."
-                    if message.get("role") == "assistant"
-                    else message.get("content", "")
-                ),
-            }
-            for message in history
-        ]
-
-    def _build_retrieved_source_log_items(
-        self, retrieved_chunks: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        return [
-            {
-                "knowledge_base_id": chunk.get("knowledge_base_id"),
-                "knowledge_base_name": chunk.get("knowledge_base_name"),
-                "document_id": chunk.get("document_id"),
-                "original_filename": chunk.get("original_filename"),
-                "chunk_index": chunk.get("chunk_index"),
-                "score": chunk.get("score"),
-                "text_length": len(str(chunk.get("text") or "")),
-            }
-            for chunk in retrieved_chunks
-        ]
-
-    def _build_system_prompt(self, retrieved_chunks: list[dict[str, Any]]) -> str:
+    def _build_system_prompt(
+        self,
+        retrieved_chunks: list[dict[str, Any]],
+        memory_summary: str | None = None,
+    ) -> str:
+        prompt_parts = [BASE_SYSTEM_PROMPT]
+        if memory_summary:
+            prompt_parts.extend(
+                [
+                    "以下是当前会话更早历史的摘要，仅用于延续上下文，不代表当前用户最新意图：",
+                    memory_summary,
+                ]
+            )
         if not retrieved_chunks:
-            return BASE_SYSTEM_PROMPT
+            return "\n\n".join(prompt_parts)
 
         context_blocks = []
         for index, chunk in enumerate(retrieved_chunks, start=1):
@@ -623,38 +878,14 @@ class ChatService:
             )
 
         # 把检索结果作为动态系统上下文交给模型，避免污染持久化聊天历史。
-        return "\n\n".join(
+        prompt_parts.extend(
             [
-                BASE_SYSTEM_PROMPT,
                 KNOWLEDGE_SYSTEM_INSTRUCTION,
                 "以下是从当前会话绑定知识库中检索到的参考内容：",
                 "\n\n".join(context_blocks),
             ]
         )
-
-    def _append_reference_section(
-        self, answer: str, retrieved_chunks: list[dict[str, Any]]
-    ) -> str:
-        if not retrieved_chunks:
-            return answer
-
-        seen_sources: set[tuple[str, str, str]] = set()
-        reference_lines: list[str] = []
-        for index, chunk in enumerate(retrieved_chunks, start=1):
-            knowledge_base_name = str(chunk.get("knowledge_base_name") or "未知知识库")
-            filename = str(chunk.get("original_filename") or "未知文档")
-            chunk_index = str(chunk.get("chunk_index"))
-            source_key = (knowledge_base_name, filename, chunk_index)
-            if source_key in seen_sources:
-                continue
-            seen_sources.add(source_key)
-            reference_lines.append(
-                f"[来源 {index}] {knowledge_base_name} / {filename} / chunk {chunk_index}"
-            )
-
-        if not reference_lines:
-            return answer
-        return f"{answer.rstrip()}\n\n参考来源：\n" + "\n".join(reference_lines)
+        return "\n\n".join(prompt_parts)
 
     def _to_retrieved_chunk_records(
         self, retrieved_chunks: list[dict[str, Any]]
@@ -737,10 +968,7 @@ class ChatService:
         return [self._message_record_from_model(message) for message in messages]
 
     def _load_history(self, session: Session, session_id: str) -> list[dict[str, str]]:
-        return [
-            {"role": message.role, "content": message.content}
-            for message in self._load_messages(session, session_id)
-        ]
+        return self._messages_to_history(self._load_context_messages(session, session_id))
 
     def _count_messages(self, session: Session, session_id: str) -> int:
         return session.scalar(

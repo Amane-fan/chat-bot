@@ -66,6 +66,23 @@ class SessionKnowledgeBase(Base):
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
 
 
+class ChatSessionMemory(Base):
+    """会话级摘要记忆。"""
+
+    __tablename__ = "chat_session_memories"
+    __table_args__ = (Index("ix_chat_session_memories_updated_at", "updated_at"),)
+
+    session_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    summary_text: Mapped[str] = mapped_column(Text, nullable=False)
+    summarized_message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+
+
 class KnowledgeBase(Base):
     """知识库元数据表，当前只保存基础信息和预留配置。"""
 
