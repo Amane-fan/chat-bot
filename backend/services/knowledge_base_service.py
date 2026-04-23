@@ -485,7 +485,6 @@ class KnowledgeBaseService:
             normalized_question,
             retrieval_log_items,
             started_at,
-            retrieved_chunks,
             rerank_log=rerank_log,
         )
         return retrieved_chunks
@@ -1291,8 +1290,10 @@ class KnowledgeBaseService:
             "status": "disabled",
             "candidate_count": len(candidates),
             "selected_count": len(candidates),
+            "pre_rerank_chunks": self._serialize_chunk_log_items(candidates),
         }
         if not config.RERANK_ENABLED:
+            rerank_log["post_rerank_chunks"] = self._serialize_chunk_log_items(candidates)
             return candidates, rerank_log
 
         rerank_top_n = self._normalize_positive_int(config.RERANK_TOP_N, top_k)
@@ -1301,6 +1302,7 @@ class KnowledgeBaseService:
                 **rerank_log,
                 "status": "skipped_no_candidates",
                 "selected_count": 0,
+                "post_rerank_chunks": [],
             }
 
         started_at = time.perf_counter()
@@ -1313,6 +1315,9 @@ class KnowledgeBaseService:
                     "status": "succeeded",
                     "selected_count": len(selected_candidates),
                     "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                    "post_rerank_chunks": self._serialize_chunk_log_items(
+                        selected_candidates
+                    ),
                 }
             )
             return selected_candidates, rerank_log
@@ -1324,7 +1329,9 @@ class KnowledgeBaseService:
                     "selected_count": len(fallback_candidates),
                     "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
                     "error_type": type(exc).__name__,
-                    "error_message": str(exc),
+                    "post_rerank_chunks": self._serialize_chunk_log_items(
+                        fallback_candidates
+                    ),
                 }
             )
             return fallback_candidates, rerank_log
@@ -1534,32 +1541,40 @@ class KnowledgeBaseService:
             "sparse_status": sparse_status,
             "index_status": index_status,
             "hit_count": len(effective_dense_hits),
-            "hits": [
-                {
-                    "score": getattr(hit, "score", None),
-                    "document_id": (hit.payload or {}).get("document_id"),
-                    "original_filename": (hit.payload or {}).get("original_filename"),
-                    "chunk_index": (hit.payload or {}).get("chunk_index"),
-                }
-                for hit in effective_dense_hits
-            ],
-            "sparse_hits": [
-                {
-                    "score": hit.get("score"),
-                    "document_id": hit.get("document_id"),
-                    "original_filename": hit.get("original_filename"),
-                    "chunk_index": hit.get("chunk_index"),
-                }
-                for hit in effective_sparse_hits
-            ],
         }
+
+    def _serialize_chunk_log_item(self, chunk: dict[str, Any]) -> dict[str, Any]:
+        """把 chunk 或候选转成最小日志结构，避免输出正文和多余元数据。"""
+
+        return {
+            "knowledge_base_id": chunk.get("knowledge_base_id"),
+            "knowledge_base_name": chunk.get("knowledge_base_name"),
+            "chunk_id": self._build_chunk_log_id(chunk),
+        }
+
+    def _serialize_chunk_log_items(
+        self, chunks: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        return [self._serialize_chunk_log_item(chunk) for chunk in chunks]
+
+    def _build_chunk_log_id(self, chunk: dict[str, Any]) -> str | None:
+        """为日志构造轻量 chunk 标识，优先使用文档 ID + 分块序号。"""
+
+        document_id = chunk.get("document_id")
+        chunk_index = chunk.get("chunk_index")
+        if document_id is None and chunk_index is None:
+            return None
+        if document_id is None:
+            return str(chunk_index)
+        if chunk_index is None:
+            return str(document_id)
+        return f"{document_id}:{chunk_index}"
 
     def _log_retrieval_result(
         self,
         question: str,
         retrieval_log_items: list[dict[str, Any]],
         started_at: float,
-        retrieved_chunks: list[dict[str, Any]],
         *,
         rerank_log: dict[str, Any] | None = None,
     ) -> None:
@@ -1569,7 +1584,6 @@ class KnowledgeBaseService:
         log_payload = {
             "question": question,
             "elapsed_ms": elapsed_ms,
-            "retrieved_chunk_count": len(retrieved_chunks),
             "rerank": rerank_log,
             "knowledge_bases": retrieval_log_items,
         }

@@ -1,3 +1,4 @@
+import json
 import unittest
 from typing import Any
 
@@ -65,6 +66,20 @@ class KnowledgeBaseRerankTest(unittest.TestCase):
         self.assertEqual(["doc-b", "doc-a"], [item["document_id"] for item in selected])
         self.assertEqual([0.91, 0.32], [item["score"] for item in selected])
         self.assertEqual("succeeded", rerank_log["status"])
+        self.assertEqual(3, len(rerank_log["pre_rerank_chunks"]))
+        self.assertEqual(["doc-b:0", "doc-a:0"], [
+            item["chunk_id"] for item in rerank_log["post_rerank_chunks"]
+        ])
+        self.assertNotIn("text", rerank_log["pre_rerank_chunks"][0])
+        self.assertNotIn("text", rerank_log["post_rerank_chunks"][0])
+        self.assertEqual(
+            {"knowledge_base_id", "knowledge_base_name", "chunk_id"},
+            set(rerank_log["pre_rerank_chunks"][0].keys()),
+        )
+        self.assertEqual(
+            {"knowledge_base_id", "knowledge_base_name", "chunk_id"},
+            set(rerank_log["post_rerank_chunks"][0].keys()),
+        )
         self.assertEqual({"text": "question"}, service.last_payload["input"]["query"])
         self.assertEqual({"text": "B"}, service.last_payload["input"]["documents"][1])
 
@@ -86,6 +101,12 @@ class KnowledgeBaseRerankTest(unittest.TestCase):
         self.assertEqual(["kb-1-a", "kb-2-a"], [item["document_id"] for item in selected])
         self.assertEqual("failed", rerank_log["status"])
         self.assertEqual("RuntimeError", rerank_log["error_type"])
+        self.assertEqual(
+            ["kb-1-a:0", "kb-2-a:0"],
+            [item["chunk_id"] for item in rerank_log["post_rerank_chunks"]],
+        )
+        self.assertNotIn("text", rerank_log["pre_rerank_chunks"][0])
+        self.assertNotIn("text", rerank_log["post_rerank_chunks"][0])
 
     def test_context_char_limit_truncates_final_chunks(self) -> None:
         service = KnowledgeBaseService()
@@ -164,8 +185,66 @@ class KnowledgeBaseRerankTest(unittest.TestCase):
         self.assertEqual(1, log_item["sparse_hit_count"])
         self.assertEqual(2, log_item["fused_candidate_count"])
         self.assertEqual("hit", log_item["sparse_cache_status"])
-        self.assertEqual("doc-a", log_item["hits"][0]["document_id"])
-        self.assertEqual("doc-b", log_item["sparse_hits"][0]["document_id"])
+        self.assertNotIn("hits", log_item)
+        self.assertNotIn("sparse_hits", log_item)
+
+    def test_rerank_disabled_log_keeps_candidates_as_post_rerank_chunks(self) -> None:
+        config.RERANK_ENABLED = False
+        service = KnowledgeBaseService()
+        candidates = [
+            self._candidate("doc-a", "A", 0.8),
+            self._candidate("doc-b", "B", 0.7),
+        ]
+
+        selected, rerank_log = service._select_retrieval_candidates(
+            "question", candidates, top_k=1
+        )
+
+        self.assertEqual(["doc-a", "doc-b"], [item["document_id"] for item in selected])
+        self.assertEqual("disabled", rerank_log["status"])
+        self.assertEqual(
+            rerank_log["pre_rerank_chunks"], rerank_log["post_rerank_chunks"]
+        )
+        self.assertNotIn("text", rerank_log["post_rerank_chunks"][0])
+
+    def test_retrieval_result_log_only_contains_chunk_metadata(self) -> None:
+        service = KnowledgeBaseService()
+        rerank_log = {
+            "enabled": True,
+            "status": "succeeded",
+            "candidate_count": 1,
+            "selected_count": 1,
+            "pre_rerank_chunks": [
+                service._serialize_chunk_log_item(self._candidate("doc-a", "A", 0.8))
+            ],
+            "post_rerank_chunks": [
+                service._serialize_chunk_log_item(self._candidate("doc-a", "A", 0.8))
+            ],
+        }
+
+        with self.assertLogs("uvicorn.error", level="INFO") as captured:
+            service._log_retrieval_result(
+                "question",
+                [{"knowledge_base_id": "kb-1", "status": "searched"}],
+                started_at=0.0,
+                rerank_log=rerank_log,
+            )
+
+        payload = json.loads(captured.output[0].split("知识库检索结果:\n", 1)[1])
+        self.assertEqual("question", payload["question"])
+        self.assertIn("pre_rerank_chunks", payload["rerank"])
+        self.assertIn("post_rerank_chunks", payload["rerank"])
+        self.assertNotIn("retrieved_chunk_count", payload)
+        self.assertNotIn("text", payload["rerank"]["pre_rerank_chunks"][0])
+        self.assertNotIn("text", payload["rerank"]["post_rerank_chunks"][0])
+        self.assertEqual(
+            {"knowledge_base_id", "knowledge_base_name", "chunk_id"},
+            set(payload["rerank"]["pre_rerank_chunks"][0].keys()),
+        )
+        self.assertEqual(
+            {"knowledge_base_id", "knowledge_base_name", "chunk_id"},
+            set(payload["rerank"]["post_rerank_chunks"][0].keys()),
+        )
 
     def _candidate(
         self,
