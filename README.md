@@ -209,7 +209,7 @@ docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant
 启动后端：
 
 ```bash
-uv run uvicorn backend.main:app --reload
+uv run python backend/main.py
 ```
 
 启动前端：

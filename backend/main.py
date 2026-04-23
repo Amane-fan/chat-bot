@@ -1,3 +1,9 @@
+import sys
+from pathlib import Path
+
+if __package__ in {None, ""}:
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -202,3 +208,9 @@ def delete_knowledge_base_document(
     return knowledge_base_service.delete_knowledge_base_document(
         knowledge_base_id, document_id
     )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host=config.API_HOST, port=config.API_PORT)
